@@ -6,8 +6,8 @@ use chrono::Utc;
 use tokio::time::{sleep, Duration};
 
 use super::{
-    load_accounts, read_current_auth, save_accounts, switch_to_account, sync_active_account_tokens,
-    update_account_chatgpt_tokens, AUTH_OPERATION_LOCK,
+    auth_matches_account, load_accounts, read_current_auth, save_accounts,
+    sync_matching_account_tokens, update_account_chatgpt_tokens, AUTH_OPERATION_LOCK,
 };
 use crate::types::{
     parse_chatgpt_id_token_claims, AccountsStore, AuthData, AuthDotJson, StoredAccount,
@@ -37,7 +37,7 @@ struct TokenRefreshUpdate {
 /// Ensure the account has non-expired ChatGPT OAuth tokens.
 /// Returns an updated account when a refresh was performed.
 pub async fn ensure_chatgpt_tokens_fresh(account: &StoredAccount) -> Result<StoredAccount> {
-    if !chatgpt_tokens_need_refresh(account) {
+    if matches!(account.auth_data, AuthData::ApiKey { .. }) {
         return Ok(account.clone());
     }
 
@@ -73,7 +73,7 @@ pub(crate) async fn ensure_chatgpt_tokens_fresh_locked(
     }
 }
 
-/// Force-refresh ChatGPT OAuth tokens for an account.
+/// Refresh a saved account unless it is the actual current Codex login.
 pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAccount> {
     if matches!(account.auth_data, AuthData::ApiKey { .. }) {
         return Ok(account.clone());
@@ -86,7 +86,11 @@ pub async fn refresh_chatgpt_tokens(account: &StoredAccount) -> Result<StoredAcc
 async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<StoredAccount> {
     let (current, is_active) = load_account_reconciling_live_auth(&account.id)?;
 
-    if is_active && crate::commands::process::ensure_codex_not_running().is_err() {
+    // Only the official client rotates the current login, even while it is
+    // stopped. Otherwise a saved replacement refresh token could be lost when
+    // the next reconciliation reads an older auth.json after an interrupted
+    // write-back. Explicit Switch handles writing a refreshed non-current login.
+    if is_active {
         return Ok(current);
     }
 
@@ -101,7 +105,7 @@ async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<Stored
     };
 
     if current_refresh_token.is_empty() {
-        anyhow::bail!("Missing refresh token for account {}", current.name);
+        anyhow::bail!("账号 {} 缺少刷新凭据，请重新登录", current.name);
     }
 
     let refreshed = refresh_tokens_with_refresh_token(&current_refresh_token).await?;
@@ -133,38 +137,38 @@ async fn refresh_chatgpt_tokens_locked(account: &StoredAccount) -> Result<Stored
         return Err(error);
     }
 
-    // Re-read active state after the network request before touching auth.json.
-    let is_active = load_accounts()?.active_account_id.as_deref() == Some(account.id.as_str());
-    if is_active {
-        if let Err(err) = switch_to_account(&updated) {
-            println!("[Auth] Failed to sync active auth.json after token refresh: {err}");
-        }
-    }
-
     Ok(updated)
 }
 
-fn reconcile_active_account_from_auth(
+fn reconcile_account_from_auth(
     store: &mut AccountsStore,
     account_id: &str,
     auth: &AuthDotJson,
 ) -> bool {
-    if store.active_account_id.as_deref() != Some(account_id) {
+    if !store
+        .accounts
+        .iter()
+        .any(|account| account.id == account_id && auth_matches_account(account, auth))
+    {
         return false;
     }
 
-    sync_active_account_tokens(store, auth)
+    sync_matching_account_tokens(store, auth)
 }
 
 fn load_account_reconciling_live_auth(account_id: &str) -> Result<(StoredAccount, bool)> {
     let mut store = load_accounts()?;
-    let is_active = store.active_account_id.as_deref() == Some(account_id);
+    let live_auth = read_current_auth()?;
+    let is_active = live_auth.as_ref().is_some_and(|auth| {
+        store
+            .accounts
+            .iter()
+            .any(|account| account.id == account_id && auth_matches_account(account, auth))
+    });
 
-    if is_active {
-        if let Some(auth) = read_current_auth()? {
-            if reconcile_active_account_from_auth(&mut store, account_id, &auth) {
-                save_accounts(&store)?;
-            }
+    if let Some(auth) = live_auth.as_ref() {
+        if reconcile_account_from_auth(&mut store, account_id, auth) {
+            save_accounts(&store)?;
         }
     }
 
@@ -172,7 +176,7 @@ fn load_account_reconciling_live_auth(account_id: &str) -> Result<(StoredAccount
         .accounts
         .into_iter()
         .find(|stored| stored.id == account_id)
-        .context("Account not found")?;
+        .context("找不到账号")?;
     Ok((account, is_active))
 }
 
@@ -183,13 +187,13 @@ pub async fn create_chatgpt_account_from_refresh_token(
     refresh_token: String,
 ) -> Result<StoredAccount> {
     if refresh_token.trim().is_empty() {
-        anyhow::bail!("Missing refresh token for account {account_name}");
+        anyhow::bail!("账号 {account_name} 缺少刷新凭据，请重新登录");
     }
 
     let refreshed = refresh_tokens_with_refresh_token(&refresh_token).await?;
     let id_token = refreshed
         .id_token
-        .context("Refresh response did not include id_token")?;
+        .context("刷新响应未包含身份凭据，请重新登录")?;
     let next_refresh_token = refreshed.refresh_token.unwrap_or(refresh_token);
     let claims = parse_chatgpt_id_token_claims(&id_token);
 
@@ -205,6 +209,7 @@ pub async fn create_chatgpt_account_from_refresh_token(
     ))
 }
 
+#[cfg(test)]
 fn chatgpt_tokens_need_refresh(account: &StoredAccount) -> bool {
     match &account.auth_data {
         AuthData::ApiKey { .. } => false,
@@ -241,13 +246,11 @@ fn resolve_refreshed_id_token(
 ) -> Result<String> {
     match refreshed_id_token {
         Some(id_token) if id_token_needs_refresh_at(&id_token, now) => {
-            anyhow::bail!("Token refresh returned an invalid or expired id_token")
+            anyhow::bail!("刷新返回的身份凭据无效或已过期，请重新登录")
         }
         Some(id_token) => Ok(id_token),
         None if id_token_needs_refresh_at(&current_id_token, now) => {
-            anyhow::bail!(
-                "Token refresh did not return a fresh id_token; sign in to the account again"
-            )
+            anyhow::bail!("刷新未返回新的身份凭据，请重新登录此账号")
         }
         None => Ok(current_id_token),
     }
@@ -322,7 +325,7 @@ async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<Refres
     let response = match response {
         Some(resp) => resp,
         None => {
-            let err = last_send_error.context("Failed to send token refresh request")?;
+            let err = last_send_error.context("发送登录凭据刷新请求失败")?;
             return Err(err.into());
         }
     };
@@ -330,20 +333,20 @@ async fn refresh_tokens_with_refresh_token(refresh_token: &str) -> Result<Refres
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("Token refresh failed: {status} - {body}");
+        anyhow::bail!("刷新登录凭据失败：{status} - {body}");
     }
 
     response
         .json::<RefreshTokenResponse>()
         .await
-        .context("Failed to parse token refresh response")
+        .context("解析登录凭据刷新响应失败")
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
         chatgpt_tokens_need_refresh, chatgpt_tokens_need_refresh_at, merge_refresh_response,
-        reconcile_active_account_from_auth, resolve_refreshed_id_token, RefreshTokenResponse,
+        reconcile_account_from_auth, resolve_refreshed_id_token, RefreshTokenResponse,
     };
     use crate::types::{AccountsStore, AuthData, AuthDotJson, StoredAccount, TokenData};
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
@@ -406,9 +409,7 @@ mod tests {
 
         let error = resolve_refreshed_id_token(current_id_token, None, now).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("did not return a fresh id_token"));
+        assert!(error.to_string().contains("未返回新的身份凭据"));
     }
 
     #[test]
@@ -452,9 +453,7 @@ mod tests {
         };
 
         assert!(chatgpt_tokens_need_refresh(&account));
-        assert!(reconcile_active_account_from_auth(
-            &mut store, &local_id, &auth
-        ));
+        assert!(reconcile_account_from_auth(&mut store, &local_id, &auth));
 
         account = store.accounts.remove(0);
         assert!(!chatgpt_tokens_need_refresh(&account));
@@ -465,7 +464,7 @@ mod tests {
     }
 
     #[test]
-    fn inactive_account_does_not_use_live_auth() {
+    fn actual_live_account_uses_rotated_tokens_without_selected_row() {
         let now = chrono::Utc::now().timestamp();
         let account = StoredAccount::new_chatgpt(
             "Inactive".into(),
@@ -479,8 +478,8 @@ mod tests {
         );
         let local_id = account.id.clone();
         let mut store = AccountsStore {
-            accounts: vec![account],
-            active_account_id: Some("different-local-account".into()),
+            accounts: vec![account.clone()],
+            active_account_id: None,
             ..AccountsStore::default()
         };
         let auth = AuthDotJson {
@@ -494,9 +493,48 @@ mod tests {
             last_refresh: None,
         };
 
-        assert!(!reconcile_active_account_from_auth(
-            &mut store, &local_id, &auth
-        ));
+        for selected in [None, Some("different-local-account".to_string())] {
+            store.accounts[0] = account.clone();
+            store.active_account_id = selected.clone();
+            assert!(reconcile_account_from_auth(&mut store, &local_id, &auth));
+            let AuthData::ChatGPT { refresh_token, .. } = &store.accounts[0].auth_data else {
+                panic!("expected ChatGPT account");
+            };
+            assert_eq!(refresh_token, "live-refresh");
+            assert_eq!(store.active_account_id, selected);
+            assert!(!chatgpt_tokens_need_refresh(&store.accounts[0]));
+        }
+    }
+
+    #[test]
+    fn selected_row_cannot_reconcile_another_real_account() {
+        let account = StoredAccount::new_chatgpt(
+            "Selected".into(),
+            None,
+            None,
+            None,
+            account_jwt("workspace-a", 1_800_000_000, "stored"),
+            "stored-access".into(),
+            "stored-refresh".into(),
+            Some("workspace-a".into()),
+        );
+        let local_id = account.id.clone();
+        let mut store = AccountsStore {
+            accounts: vec![account],
+            active_account_id: Some(local_id.clone()),
+            ..AccountsStore::default()
+        };
+        let auth = AuthDotJson {
+            openai_api_key: None,
+            tokens: Some(TokenData {
+                id_token: account_jwt("workspace-b", 1_800_000_000, "live"),
+                access_token: "live-access".into(),
+                refresh_token: "live-refresh".into(),
+                account_id: Some("workspace-b".into()),
+            }),
+            last_refresh: None,
+        };
+        assert!(!reconcile_account_from_auth(&mut store, &local_id, &auth));
         let AuthData::ChatGPT { refresh_token, .. } = &store.accounts[0].auth_data else {
             panic!("expected ChatGPT account");
         };

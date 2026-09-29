@@ -6,6 +6,7 @@ use crate::api::usage::{
 };
 use crate::auth::{
     ensure_chatgpt_tokens_fresh, get_account, load_accounts, update_account_metadata,
+    AUTH_OPERATION_LOCK,
 };
 use crate::types::{AccountInfo, AuthData, UsageInfo, WarmupSummary};
 use futures::{stream, StreamExt};
@@ -35,7 +36,7 @@ pub(crate) fn apply_cached_account_metadata(account: &mut AccountInfo) {
 pub async fn fetch_usage(account_id: &str) -> Result<UsageInfo, String> {
     let account = get_account(account_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Account not found: {account_id}"))?;
+        .ok_or_else(|| format!("找不到账号：{account_id}"))?;
 
     get_account_usage(&account).await.map_err(|e| e.to_string())
 }
@@ -61,7 +62,7 @@ pub async fn get_usage(app: tauri::AppHandle, account_id: String) -> Result<Usag
 pub async fn refresh_account_metadata(account_id: String) -> Result<AccountInfo, String> {
     let account = get_account(&account_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Account not found: {account_id}"))?;
+        .ok_or_else(|| format!("找不到账号：{account_id}"))?;
 
     let (updated, live_metadata) = match &account.auth_data {
         AuthData::ApiKey { .. } => (account, None),
@@ -73,21 +74,26 @@ pub async fn refresh_account_metadata(account_id: String) -> Result<AccountInfo,
                 .await
                 .map_err(|e| e.to_string())?;
 
-            update_account_metadata(
-                &account_id,
-                None,
-                None,
-                live_metadata.plan_type.clone(),
-                None,
-            )
-            .map_err(|e| e.to_string())?;
+            let updated = {
+                // Token refresh above takes the same lock. Acquire it only
+                // after the network work, for this store read-modify-write.
+                let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
+                update_account_metadata(
+                    &account_id,
+                    None,
+                    None,
+                    live_metadata.plan_type.clone(),
+                    None,
+                )
+                .map_err(|e| e.to_string())?
+            };
 
             ACCOUNT_METADATA_CACHE
                 .lock()
-                .map_err(|_| "Account metadata cache is unavailable".to_string())?
+                .map_err(|_| "账号信息缓存暂不可用".to_string())?
                 .insert(account_id.clone(), live_metadata.clone());
 
-            (refreshed, Some(live_metadata))
+            (updated, Some(live_metadata))
         }
     };
 
@@ -115,7 +121,7 @@ pub async fn refresh_all_accounts_usage() -> Result<Vec<UsageInfo>, String> {
 pub async fn warmup_account(account_id: String) -> Result<(), String> {
     let account = get_account(&account_id)
         .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("Account not found: {account_id}"))?;
+        .ok_or_else(|| format!("找不到账号：{account_id}"))?;
 
     send_warmup(&account).await.map_err(|e| e.to_string())
 }

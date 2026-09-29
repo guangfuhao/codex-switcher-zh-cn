@@ -203,13 +203,13 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> tauri::
 
     let tray_settings = Submenu::with_items(
         app,
-        "Tray",
+        "菜单栏显示",
         true,
         &[
             &CheckMenuItem::with_id(
                 app,
                 TRAY_ICON_AND_SESSION_ID,
-                "Icon + Session",
+                "图标和当前时段额度",
                 true,
                 settings.tray_display_mode == TrayDisplayMode::IconAndSession,
                 None::<&str>,
@@ -217,7 +217,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> tauri::
             &CheckMenuItem::with_id(
                 app,
                 TRAY_ACTIVE_USAGE_TEXT_ID,
-                "Hourly + Weekly",
+                "时段额度和每周额度",
                 true,
                 settings.tray_display_mode == TrayDisplayMode::ActiveUsageText,
                 None::<&str>,
@@ -225,7 +225,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> tauri::
             &CheckMenuItem::with_id(
                 app,
                 TRAY_HIDDEN_ID,
-                "Hidden",
+                "隐藏",
                 true,
                 settings.tray_display_mode == TrayDisplayMode::Hidden,
                 None::<&str>,
@@ -236,13 +236,13 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> tauri::
     #[cfg(target_os = "macos")]
     let dock_settings = Submenu::with_items(
         app,
-        "Dock Icon",
+        "程序坞图标",
         true,
         &[
             &CheckMenuItem::with_id(
                 app,
                 DOCK_SHOW_IN_DOCK_ID,
-                "Show in Dock",
+                "在程序坞显示",
                 true,
                 settings.dock_display_mode == DockDisplayMode::ShowInDock,
                 None::<&str>,
@@ -250,7 +250,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> tauri::
             &CheckMenuItem::with_id(
                 app,
                 DOCK_MENU_BAR_ONLY_ID,
-                "Menu Bar Only",
+                "仅显示在菜单栏",
                 true,
                 settings.dock_display_mode == DockDisplayMode::MenuBarOnly,
                 None::<&str>,
@@ -261,7 +261,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> tauri::
     let desktop_reopen_settings = MenuItem::with_id(
         app,
         DESKTOP_REOPEN_SETTINGS_ID,
-        "Reopen Codex after force close...",
+        "关闭后重新打开 Codex…",
         cfg!(any(target_os = "macos", windows)),
         None::<&str>,
     )?;
@@ -269,7 +269,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> tauri::
     #[cfg(target_os = "macos")]
     let settings_menu = Submenu::with_items(
         app,
-        "Settings",
+        "设置",
         true,
         &[&tray_settings, &dock_settings, &desktop_reopen_settings],
     )?;
@@ -277,25 +277,25 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> tauri::
     #[cfg(not(target_os = "macos"))]
     let settings_menu = Submenu::with_items(
         app,
-        "Settings",
+        "设置",
         true,
         &[&tray_settings, &desktop_reopen_settings],
     )?;
 
     let window_menu = Submenu::with_items(
         app,
-        "Window",
+        "窗口",
         true,
         &[
-            &PredefinedMenuItem::minimize(app, None)?,
-            &PredefinedMenuItem::maximize(app, None)?,
+            &PredefinedMenuItem::minimize(app, Some("最小化"))?,
+            &PredefinedMenuItem::maximize(app, Some("缩放"))?,
             #[cfg(target_os = "macos")]
             &PredefinedMenuItem::separator(app)?,
-            &PredefinedMenuItem::close_window(app, None)?,
+            &PredefinedMenuItem::close_window(app, Some("关闭窗口"))?,
         ],
     )?;
 
-    let help_menu = Submenu::with_items(app, "Help", true, &[])?;
+    let help_menu = Submenu::with_items(app, "帮助", true, &[])?;
 
     Menu::with_items(
         app,
@@ -303,19 +303,23 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> tauri::
             #[cfg(target_os = "macos")]
             &Submenu::with_items(
                 app,
-                pkg_info.name.clone(),
+                "Codex 账号切换",
                 true,
                 &[
-                    &PredefinedMenuItem::about(app, None, Some(about_metadata))?,
+                    &PredefinedMenuItem::about(
+                        app,
+                        Some("关于 Codex 账号切换工具"),
+                        Some(about_metadata),
+                    )?,
                     &PredefinedMenuItem::separator(app)?,
                     &settings_menu,
                     &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::services(app, None)?,
+                    &PredefinedMenuItem::services(app, Some("服务"))?,
                     &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::hide(app, None)?,
-                    &PredefinedMenuItem::hide_others(app, None)?,
+                    &PredefinedMenuItem::hide(app, Some("隐藏账号切换工具"))?,
+                    &PredefinedMenuItem::hide_others(app, Some("隐藏其他应用"))?,
                     &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::quit(app, None)?,
+                    &PredefinedMenuItem::quit(app, Some("退出账号切换工具"))?,
                 ],
             )?,
             #[cfg(not(any(
@@ -327,34 +331,34 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, settings: &AppSettings) -> tauri::
             )))]
             &Submenu::with_items(
                 app,
-                "File",
+                "文件",
                 true,
                 &[
-                    &PredefinedMenuItem::close_window(app, None)?,
+                    &PredefinedMenuItem::close_window(app, Some("关闭窗口"))?,
                     #[cfg(not(target_os = "macos"))]
-                    &PredefinedMenuItem::quit(app, None)?,
+                    &PredefinedMenuItem::quit(app, Some("退出账号切换工具"))?,
                 ],
             )?,
             &Submenu::with_items(
                 app,
-                "Edit",
+                "编辑",
                 true,
                 &[
-                    &PredefinedMenuItem::undo(app, None)?,
-                    &PredefinedMenuItem::redo(app, None)?,
+                    &PredefinedMenuItem::undo(app, Some("撤销"))?,
+                    &PredefinedMenuItem::redo(app, Some("重做"))?,
                     &PredefinedMenuItem::separator(app)?,
-                    &PredefinedMenuItem::cut(app, None)?,
-                    &PredefinedMenuItem::copy(app, None)?,
-                    &PredefinedMenuItem::paste(app, None)?,
-                    &PredefinedMenuItem::select_all(app, None)?,
+                    &PredefinedMenuItem::cut(app, Some("剪切"))?,
+                    &PredefinedMenuItem::copy(app, Some("复制"))?,
+                    &PredefinedMenuItem::paste(app, Some("粘贴"))?,
+                    &PredefinedMenuItem::select_all(app, Some("全选"))?,
                 ],
             )?,
             #[cfg(target_os = "macos")]
             &Submenu::with_items(
                 app,
-                "View",
+                "显示",
                 true,
-                &[&PredefinedMenuItem::fullscreen(app, None)?],
+                &[&PredefinedMenuItem::fullscreen(app, Some("进入全屏幕"))?],
             )?,
             #[cfg(not(target_os = "macos"))]
             &settings_menu,

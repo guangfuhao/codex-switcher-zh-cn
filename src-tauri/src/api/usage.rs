@@ -79,7 +79,7 @@ pub async fn get_account_usage(account: &StoredAccount) -> Result<UsageInfo> {
             has_credits: None,
             unlimited_credits: None,
             credits_balance: None,
-            error: Some("Usage info not available for API key accounts".to_string()),
+            error: Some("API 密钥账号不提供此用量信息".to_string()),
         }),
         AuthData::ChatGPT { .. } => get_usage_with_chatgpt_auth(account).await,
     }
@@ -106,24 +106,21 @@ pub async fn fetch_chatgpt_account_metadata(
         let body = response.text().await.unwrap_or_default();
         if status == StatusCode::FORBIDDEN {
             anyhow::bail!(
-                "Accounts check API returned 403 Forbidden. \
-                 The request was likely blocked by Cloudflare bot detection. \
-                 This is a transient network issue — please try again in a moment."
+                "账号信息接口返回 403，访问被拒绝。 \
+                 请求可能被 Cloudflare 的自动访问检查拦截。 \
+                 请稍后重试。"
             );
         }
-        anyhow::bail!("Accounts check API error: {status} - {body}");
+        anyhow::bail!("账号信息接口返回错误：{status} - {body}");
     }
 
-    let payload: AccountsCheckResponse = response
-        .json()
-        .await
-        .context("Failed to parse accounts check response")?;
+    let payload: AccountsCheckResponse = response.json().await.context("解析账号信息响应失败")?;
 
     let selected_entry = chatgpt_account_id
         .and_then(|account_id| payload.accounts.get(account_id))
         .or_else(|| payload.accounts.get("default"))
         .or_else(|| payload.accounts.values().next())
-        .context("Accounts check response did not include an account entry")?;
+        .context("账号信息响应中未包含账号")?;
 
     Ok(ChatGptAccountMetadata {
         plan_type: selected_entry
@@ -175,17 +172,14 @@ async fn parse_usage_response(
     if !status.is_success() {
         return Ok(UsageInfo::error(
             account_id.to_string(),
-            format!("API error: {status}"),
+            format!("接口错误：{status}"),
         ));
     }
 
-    let body_text = response
-        .text()
-        .await
-        .context("Failed to read response body")?;
+    let body_text = response.text().await.context("读取接口响应失败")?;
 
     let payload: RateLimitStatusPayload =
-        serde_json::from_str(&body_text).context("Failed to parse usage response")?;
+        serde_json::from_str(&body_text).context("解析用量响应失败")?;
 
     let usage = convert_payload_to_usage_info(account_id, payload);
     println!("[Usage] Refreshed account: {account_name}");
@@ -216,7 +210,7 @@ async fn warmup_with_chatgpt_auth(account: &StoredAccount) -> Result<()> {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         println!("[Warmup] ChatGPT warm-up error response: {body}");
-        anyhow::bail!("ChatGPT warm-up failed with status {status}");
+        anyhow::bail!("ChatGPT 预热失败，状态码：{status}");
     }
 
     let body = response.text().await.unwrap_or_default();
@@ -235,13 +229,13 @@ async fn warmup_with_api_key(api_key: &str) -> Result<()> {
         .json(&payload)
         .send()
         .await
-        .context("Failed to send API key warm-up request")?;
+        .context("发送 API 密钥账号预热请求失败")?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().await.unwrap_or_default();
         println!("[Warmup] API key warm-up error response: {body}");
-        anyhow::bail!("API key warm-up failed with status {status}");
+        anyhow::bail!("API 密钥账号预热失败，状态码：{status}");
     }
 
     let body = response.text().await.unwrap_or_default();
@@ -300,7 +294,7 @@ fn build_chatgpt_headers(
 
     headers.insert(
         AUTHORIZATION,
-        HeaderValue::from_str(&format!("Bearer {access_token}")).context("Invalid access token")?,
+        HeaderValue::from_str(&format!("Bearer {access_token}")).context("访问凭据无效")?,
     );
 
     // Browser-like headers that Cloudflare uses to distinguish real browsers
@@ -342,7 +336,7 @@ fn extract_chatgpt_auth(account: &StoredAccount) -> Result<(&str, Option<&str>)>
             account_id,
             ..
         } => Ok((access_token.as_str(), account_id.as_deref())),
-        AuthData::ApiKey { .. } => anyhow::bail!("Account is not using ChatGPT OAuth"),
+        AuthData::ApiKey { .. } => anyhow::bail!("此账号没有使用 ChatGPT 授权登录"),
     }
 }
 
@@ -371,7 +365,7 @@ async fn send_chatgpt_get_request(
         .headers(headers)
         .send()
         .await
-        .with_context(|| format!("Failed to send GET request to {url}"))
+        .with_context(|| format!("请求接口失败：{url}"))
 }
 
 async fn send_chatgpt_warmup_request(
@@ -389,7 +383,7 @@ async fn send_chatgpt_warmup_request(
         .json(&payload)
         .send()
         .await
-        .context("Failed to send ChatGPT warm-up request")
+        .context("发送 ChatGPT 预热请求失败")
 }
 
 fn log_warmup_response(source: &str, body: &str, is_sse: bool) {

@@ -26,7 +26,7 @@ export async function invokeBackend<T>(
     const message =
       typeof payload?.error === "string"
         ? payload.error
-        : `Request failed with status ${response.status}`;
+        : `请求失败，状态码 ${response.status}`;
     throw new Error(message);
   }
 
@@ -49,7 +49,7 @@ export async function pickAuthJsonFile(): Promise<FileSource | null> {
     const selected = await open({
       multiple: false,
       filters: [{ name: "JSON", extensions: ["json"] }],
-      title: "Select auth.json file",
+      title: "选择 auth.json 文件",
     });
 
     if (!selected || Array.isArray(selected)) return null;
@@ -63,9 +63,9 @@ export async function exportFullBackupFile(): Promise<boolean> {
   if (isTauriRuntime()) {
     const { save } = await import("@tauri-apps/plugin-dialog");
     const selected = await save({
-      title: "Export Full Encrypted Account Config",
+      title: "导出完整加密账号备份",
       defaultPath: "codex-switcher-full.cswf",
-      filters: [{ name: "Codex Switcher Full Backup", extensions: ["cswf"] }],
+      filters: [{ name: "Codex Switcher 完整备份", extensions: ["cswf"] }],
     });
 
     if (!selected) return false;
@@ -87,8 +87,8 @@ export async function importFullBackupFile(): Promise<ImportAccountsSummary | nu
     const { open } = await import("@tauri-apps/plugin-dialog");
     const selected = await open({
       multiple: false,
-      title: "Import Full Encrypted Account Config",
-      filters: [{ name: "Codex Switcher Full Backup", extensions: ["cswf"] }],
+      title: "导入完整加密账号备份",
+      filters: [{ name: "Codex Switcher 完整备份", extensions: ["cswf"] }],
     });
 
     if (!selected || Array.isArray(selected)) return null;
@@ -107,7 +107,7 @@ export async function importFullBackupFile(): Promise<ImportAccountsSummary | nu
 }
 
 export function describeFileSource(source: FileSource | null): string {
-  if (!source) return "No file selected";
+  if (!source) return "尚未选择文件";
   return typeof source === "string" ? source : source.name;
 }
 

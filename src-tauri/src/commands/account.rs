@@ -1,12 +1,14 @@
 //! Account management Tauri commands
 
 use crate::auth::{
-    add_account, create_chatgpt_account_from_refresh_token, ensure_chatgpt_tokens_fresh_locked,
-    get_active_account, import_from_auth_json, import_from_auth_json_contents, load_accounts,
-    read_current_auth, remove_account, save_accounts, set_active_account, switch_to_account,
-    sync_active_account_tokens, touch_account, AUTH_OPERATION_LOCK,
+    add_account, auth_matches_account, create_chatgpt_account_from_refresh_token,
+    ensure_chatgpt_tokens_fresh_locked, import_from_auth_json, import_from_auth_json_contents,
+    load_accounts, read_current_auth, remove_account, save_accounts, set_active_account,
+    switch_to_account, sync_matching_account_tokens, touch_account, AUTH_OPERATION_LOCK,
 };
-use crate::types::{AccountInfo, AccountsStore, AuthData, ImportAccountsSummary, StoredAccount};
+use crate::types::{
+    AccountInfo, AccountsStore, AuthData, AuthDotJson, ImportAccountsSummary, StoredAccount,
+};
 
 use super::process::ensure_codex_not_running;
 
@@ -24,12 +26,6 @@ use sha2::Sha256;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Write};
-
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
-
-#[cfg(windows)]
-const CREATE_NO_WINDOW: u32 = 0x08000000;
 
 const SLIM_EXPORT_PREFIX: &str = "css1.";
 const SLIM_FORMAT_VERSION: u8 = 1;
@@ -69,10 +65,27 @@ struct SlimAccountPayload {
     refresh_token: Option<String>,
 }
 
+// Display the actual official login, never a stale selection from another session.
+pub(crate) fn load_accounts_for_display() -> anyhow::Result<AccountsStore> {
+    let mut store = load_accounts()?;
+    select_live_account(&mut store, read_current_auth().ok().flatten().as_ref());
+    Ok(store)
+}
+
+fn select_live_account(store: &mut AccountsStore, auth: Option<&AuthDotJson>) {
+    store.active_account_id = auth.and_then(|auth| {
+        store
+            .accounts
+            .iter()
+            .find(|account| auth_matches_account(account, auth))
+            .map(|account| account.id.clone())
+    });
+}
+
 /// List all accounts with their info
 #[tauri::command]
 pub async fn list_accounts() -> Result<Vec<AccountInfo>, String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
+    let store = load_accounts_for_display().map_err(|e| e.to_string())?;
     let active_id = store.active_account_id.as_deref();
 
     let accounts: Vec<AccountInfo> = store
@@ -91,10 +104,14 @@ pub async fn list_accounts() -> Result<Vec<AccountInfo>, String> {
 /// Get the currently active account
 #[tauri::command]
 pub async fn get_active_account_info() -> Result<Option<AccountInfo>, String> {
-    let store = load_accounts().map_err(|e| e.to_string())?;
+    let store = load_accounts_for_display().map_err(|e| e.to_string())?;
     let active_id = store.active_account_id.as_deref();
 
-    if let Some(active) = get_active_account().map_err(|e| e.to_string())? {
+    if let Some(active) = store
+        .accounts
+        .iter()
+        .find(|account| Some(account.id.as_str()) == active_id)
+    {
         let mut info = AccountInfo::from_stored(&active, active_id);
         super::usage::apply_cached_account_metadata(&mut info);
         Ok(Some(info))
@@ -106,6 +123,7 @@ pub async fn get_active_account_info() -> Result<Option<AccountInfo>, String> {
 /// Add an account from an auth.json file
 #[tauri::command]
 pub async fn add_account_from_file(path: String, name: String) -> Result<AccountInfo, String> {
+    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
     // Import from the file
     let account = import_from_auth_json(&path, name).map_err(|e| e.to_string())?;
 
@@ -123,6 +141,7 @@ pub async fn add_account_from_auth_json_text(
     name: String,
     contents: String,
 ) -> Result<AccountInfo, String> {
+    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
     let account = import_from_auth_json_contents(&contents, name).map_err(|e| e.to_string())?;
     let stored = add_account(account).map_err(|e| e.to_string())?;
 
@@ -146,27 +165,37 @@ pub async fn switch_account_by_id(account_id: &str) -> Result<(), String> {
         .accounts
         .iter()
         .position(|account| account.id == account_id)
-        .ok_or_else(|| format!("Account not found: {account_id}"))?;
+        .ok_or_else(|| format!("找不到账号：{account_id}"))?;
 
-    if store.active_account_id.as_deref() == Some(account_id) {
-        return Ok(());
+    // The on-disk login is authoritative. Importing the currently signed-in
+    // account must preserve rotated tokens even before Switcher marks it active.
+    if let Some(auth) = read_current_auth().map_err(|e| e.to_string())? {
+        if sync_matching_account_tokens(&mut store, &auth) {
+            save_accounts(&store).map_err(|e| e.to_string())?;
+        }
+        if auth_matches_account(&store.accounts[target_index], &auth) {
+            set_active_account(account_id).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
     }
 
     ensure_codex_not_running()?;
-
-    // ChatGPT rotates single-use refresh tokens. Preserve the latest token
-    // before replacing auth.json, otherwise switching back restores a stale one.
-    if let Some(auth) = read_current_auth().map_err(|e| e.to_string())? {
-        if sync_active_account_tokens(&mut store, &auth) {
-            save_accounts(&store).map_err(|e| e.to_string())?;
-        }
-    }
 
     let account = ensure_chatgpt_tokens_fresh_locked(&store.accounts[target_index])
         .await
         .map_err(|e| e.to_string())?;
 
-    // Write to ~/.codex/auth.json
+    // Refresh can take time; a desktop/CLI could have started in the meantime.
+    ensure_codex_not_running()?;
+    // Preserve any final rotation before replacing the current login.
+    if let Some(auth) = read_current_auth().map_err(|e| e.to_string())? {
+        let mut latest = load_accounts().map_err(|e| e.to_string())?;
+        if sync_matching_account_tokens(&mut latest, &auth) {
+            save_accounts(&latest).map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Write to ~/.codex/auth.json only after all consumers have exited.
     switch_to_account(&account).map_err(|e| e.to_string())?;
 
     // Update the active account in our store
@@ -175,32 +204,13 @@ pub async fn switch_account_by_id(account_id: &str) -> Result<(), String> {
     // Update last_used_at
     touch_account(account_id).map_err(|e| e.to_string())?;
 
-    // Restart Antigravity background process if it is running
-    // This allows it to pick up the new authorization file seamlessly
-    if let Ok(pids) = find_antigravity_processes() {
-        for pid in pids {
-            #[cfg(unix)]
-            {
-                let _ = std::process::Command::new("kill")
-                    .arg("-9")
-                    .arg(pid.to_string())
-                    .output();
-            }
-            #[cfg(windows)]
-            {
-                let _ = std::process::Command::new("taskkill")
-                    .args(["/F", "/PID", &pid.to_string()])
-                    .output();
-            }
-        }
-    }
-
     Ok(())
 }
 
 /// Remove an account
 #[tauri::command]
 pub async fn delete_account(account_id: String) -> Result<(), String> {
+    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
     remove_account(&account_id).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -208,6 +218,7 @@ pub async fn delete_account(account_id: String) -> Result<(), String> {
 /// Rename an account
 #[tauri::command]
 pub async fn rename_account(account_id: String, new_name: String) -> Result<(), String> {
+    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
     crate::auth::storage::update_account_metadata(&account_id, Some(new_name), None, None, None)
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -224,6 +235,7 @@ pub async fn export_accounts_slim_text() -> Result<String, String> {
 /// Import minimal account config from a compact text string, skipping existing accounts.
 #[tauri::command]
 pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccountsSummary, String> {
+    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
     let slim_payload = decode_slim_payload(&payload).map_err(|e| format!("{e:#}"))?;
     let total_in_payload = slim_payload.accounts.len();
 
@@ -234,7 +246,7 @@ pub async fn import_accounts_slim_text(payload: String) -> Result<ImportAccounts
         .await
         .map_err(|e| {
             format!(
-                "{e:#}\nHint: Slim import needs network access to refresh ChatGPT tokens. You can use Full encrypted file import when offline."
+                "{e:#}\n提示：精简导入需要联网刷新 ChatGPT 登录凭据；离线时可导入完整加密备份文件。"
             )
         })?;
     validate_imported_store(&imported).map_err(|e| format!("{e:#}"))?;
@@ -269,6 +281,7 @@ pub async fn export_accounts_full_encrypted_bytes() -> Result<Vec<u8>, String> {
 pub async fn import_accounts_full_encrypted_file(
     path: String,
 ) -> Result<ImportAccountsSummary, String> {
+    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
     let encrypted = read_encrypted_file(&path).map_err(|e| e.to_string())?;
     let imported = decode_full_encrypted_store(&encrypted, FULL_PRESET_PASSPHRASE)
         .map_err(|e| e.to_string())?;
@@ -284,6 +297,7 @@ pub async fn import_accounts_full_encrypted_file(
 pub async fn import_accounts_full_encrypted_bytes(
     bytes: Vec<u8>,
 ) -> Result<ImportAccountsSummary, String> {
+    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
     let imported =
         decode_full_encrypted_store(&bytes, FULL_PRESET_PASSPHRASE).map_err(|e| e.to_string())?;
     validate_imported_store(&imported).map_err(|e| e.to_string())?;
@@ -292,71 +306,6 @@ pub async fn import_accounts_full_encrypted_bytes(
     let (merged, summary) = merge_accounts_store(current, imported);
     save_accounts(&merged).map_err(|e| e.to_string())?;
     Ok(summary)
-}
-
-/// Find all running Antigravity codex assistant processes
-fn find_antigravity_processes() -> anyhow::Result<Vec<u32>> {
-    let mut pids = Vec::new();
-
-    #[cfg(unix)]
-    {
-        // Use ps with custom format to get the pid and full command line
-        let output = std::process::Command::new("ps")
-            .args(["-eo", "pid,command"])
-            .output()?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines().skip(1) {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-
-            if let Some((pid_str, command)) = line.split_once(' ') {
-                let pid_str = pid_str.trim();
-                let command = command.trim();
-
-                // Antigravity processes have a specific path format
-                let is_antigravity = (command.contains(".antigravity/extensions/openai.chatgpt")
-                    || command.contains(".vscode/extensions/openai.chatgpt"))
-                    && (command.ends_with("codex app-server --analytics-default-enabled")
-                        || command.contains("/codex app-server"));
-
-                if is_antigravity {
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        pids.push(pid);
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(windows)]
-    {
-        // Use tasklist on Windows
-        // For Windows we might need a more precise WMI query to get command line args,
-        // but for now we look for codex.exe PIDs and verify they're not ours
-        let output = std::process::Command::new("tasklist")
-            .creation_flags(CREATE_NO_WINDOW)
-            .args(["/FI", "IMAGENAME eq codex.exe", "/FO", "CSV", "/NH"])
-            .output()?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() > 1 {
-                let name = parts[0].trim_matches('"').to_lowercase();
-                if name == "codex.exe" {
-                    let pid_str = parts[1].trim_matches('"');
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        pids.push(pid);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(pids)
 }
 
 fn encode_slim_payload_from_store(store: &AccountsStore) -> anyhow::Result<String> {
@@ -393,8 +342,8 @@ fn encode_slim_payload_from_store(store: &AccountsStore) -> anyhow::Result<Strin
         accounts: slim_accounts,
     };
 
-    let json = serde_json::to_vec(&payload).context("Failed to serialize slim payload")?;
-    let compressed = compress_bytes(&json).context("Failed to compress slim payload")?;
+    let json = serde_json::to_vec(&payload).context("生成精简账号备份失败")?;
+    let compressed = compress_bytes(&json).context("压缩精简账号备份失败")?;
 
     Ok(format!(
         "{SLIM_EXPORT_PREFIX}{}",
@@ -405,7 +354,7 @@ fn encode_slim_payload_from_store(store: &AccountsStore) -> anyhow::Result<Strin
 fn decode_slim_payload(payload: &str) -> anyhow::Result<SlimPayload> {
     let normalized: String = payload.chars().filter(|c| !c.is_whitespace()).collect();
     if normalized.is_empty() {
-        anyhow::bail!("Import string is empty");
+        anyhow::bail!("导入内容为空");
     }
 
     let encoded = normalized
@@ -414,13 +363,13 @@ fn decode_slim_payload(payload: &str) -> anyhow::Result<SlimPayload> {
 
     let compressed = URL_SAFE_NO_PAD
         .decode(encoded)
-        .context("Invalid slim import string (base64 decode failed)")?;
+        .context("精简备份格式无效（Base64 解码失败）")?;
 
     let decompressed = decompress_bytes_with_limit(&compressed, MAX_IMPORT_JSON_BYTES)
-        .context("Invalid slim import string (decompression failed)")?;
+        .context("精简备份格式无效（解压失败）")?;
 
-    let parsed: SlimPayload = serde_json::from_slice(&decompressed)
-        .context("Invalid slim import string (JSON parse failed)")?;
+    let parsed: SlimPayload =
+        serde_json::from_slice(&decompressed).context("精简备份格式无效（JSON 解析失败）")?;
 
     validate_slim_payload(&parsed)?;
     Ok(parsed)
@@ -428,21 +377,18 @@ fn decode_slim_payload(payload: &str) -> anyhow::Result<SlimPayload> {
 
 fn validate_slim_payload(payload: &SlimPayload) -> anyhow::Result<()> {
     if payload.version != SLIM_FORMAT_VERSION {
-        anyhow::bail!("Unsupported slim payload version: {}", payload.version);
+        anyhow::bail!("不支持此精简备份版本：{}", payload.version);
     }
 
     let mut names = HashSet::new();
 
     for account in &payload.accounts {
         if account.name.trim().is_empty() {
-            anyhow::bail!("Slim import contains an account with empty name");
+            anyhow::bail!("精简备份中有账号名称为空");
         }
 
         if !names.insert(account.name.clone()) {
-            anyhow::bail!(
-                "Slim import contains duplicate account name: {}",
-                account.name
-            );
+            anyhow::bail!("精简备份中存在重复账号名称：{}", account.name);
         }
 
         match account.auth_type {
@@ -452,7 +398,7 @@ fn validate_slim_payload(payload: &SlimPayload) -> anyhow::Result<()> {
                     .as_ref()
                     .map_or(true, |key| key.trim().is_empty())
                 {
-                    anyhow::bail!("API key is missing for account {}", account.name);
+                    anyhow::bail!("账号 {} 缺少 API 密钥", account.name);
                 }
             }
             SLIM_AUTH_CHATGPT => {
@@ -461,12 +407,12 @@ fn validate_slim_payload(payload: &SlimPayload) -> anyhow::Result<()> {
                     .as_ref()
                     .map_or(true, |token| token.trim().is_empty())
                 {
-                    anyhow::bail!("Refresh token is missing for account {}", account.name);
+                    anyhow::bail!("账号 {} 缺少刷新凭据", account.name);
                 }
             }
             _ => {
                 anyhow::bail!(
-                    "Unsupported auth type {} for account {}",
+                    "不支持认证类型 {}（账号：{}）",
                     account.auth_type,
                     account.name
                 );
@@ -476,7 +422,7 @@ fn validate_slim_payload(payload: &SlimPayload) -> anyhow::Result<()> {
 
     if let Some(active_name) = &payload.active_name {
         if !names.contains(active_name) {
-            anyhow::bail!("Slim import references missing active account: {active_name}");
+            anyhow::bail!("精简备份引用了不存在的当前账号：{active_name}");
         }
     }
 
@@ -529,21 +475,15 @@ async fn restore_slim_accounts(
         let account = match entry.auth_type {
             SLIM_AUTH_API_KEY => StoredAccount::new_api_key(
                 account_name.clone(),
-                entry.api_key.context("API key payload is missing")?,
+                entry.api_key.context("导入数据缺少 API 密钥")?,
             ),
             SLIM_AUTH_CHATGPT => {
-                let refresh_token = entry
-                    .refresh_token
-                    .context("Refresh token payload is missing")?;
+                let refresh_token = entry.refresh_token.context("导入数据缺少刷新凭据")?;
                 create_chatgpt_account_from_refresh_token(account_name.clone(), refresh_token)
                     .await
-                    .with_context(|| {
-                        format!(
-                            "Failed to restore ChatGPT account `{account_name}` from refresh token"
-                        )
-                    })?
+                    .with_context(|| format!("无法通过刷新凭据恢复 ChatGPT 账号“{account_name}”"))?
             }
-            _ => anyhow::bail!("Unsupported auth type in slim payload"),
+            _ => anyhow::bail!("精简备份中的认证类型不受支持"),
         };
         Ok::<StoredAccount, anyhow::Error>(account)
     }))
@@ -557,8 +497,8 @@ async fn restore_slim_accounts(
 }
 
 fn encode_full_encrypted_store(store: &AccountsStore, passphrase: &str) -> anyhow::Result<Vec<u8>> {
-    let json = serde_json::to_vec(store).context("Failed to serialize account store")?;
-    let compressed = compress_bytes(&json).context("Failed to compress account store")?;
+    let json = serde_json::to_vec(store).context("生成账号备份数据失败")?;
+    let compressed = compress_bytes(&json).context("压缩账号备份失败")?;
 
     let mut salt = [0u8; FULL_SALT_LEN];
     rand::rng().fill_bytes(&mut salt);
@@ -570,7 +510,7 @@ fn encode_full_encrypted_store(store: &AccountsStore, passphrase: &str) -> anyho
     let cipher = XChaCha20Poly1305::new((&key).into());
     let ciphertext = cipher
         .encrypt(XNonce::from_slice(&nonce), compressed.as_slice())
-        .map_err(|_| anyhow::anyhow!("Failed to encrypt account store"))?;
+        .map_err(|_| anyhow::anyhow!("加密账号备份失败"))?;
 
     let mut out = Vec::with_capacity(4 + 1 + FULL_SALT_LEN + FULL_NONCE_LEN + ciphertext.len());
     out.extend_from_slice(FULL_FILE_MAGIC);
@@ -587,21 +527,21 @@ fn decode_full_encrypted_store(
     passphrase: &str,
 ) -> anyhow::Result<AccountsStore> {
     if file_bytes.len() as u64 > MAX_IMPORT_FILE_BYTES {
-        anyhow::bail!("Encrypted file is too large");
+        anyhow::bail!("加密备份文件过大");
     }
 
     let header_len = 4 + 1 + FULL_SALT_LEN + FULL_NONCE_LEN;
     if file_bytes.len() <= header_len {
-        anyhow::bail!("Encrypted file is invalid or truncated");
+        anyhow::bail!("加密备份文件无效或不完整");
     }
 
     if &file_bytes[..4] != FULL_FILE_MAGIC {
-        anyhow::bail!("Encrypted file header is invalid");
+        anyhow::bail!("加密备份文件头无效");
     }
 
     let version = file_bytes[4];
     if version != FULL_FILE_VERSION {
-        anyhow::bail!("Unsupported encrypted file version: {version}");
+        anyhow::bail!("不支持此加密备份版本：{version}");
     }
 
     let salt_start = 5;
@@ -616,15 +556,12 @@ fn decode_full_encrypted_store(
     let cipher = XChaCha20Poly1305::new((&key).into());
     let compressed = cipher
         .decrypt(XNonce::from_slice(nonce), ciphertext)
-        .map_err(|_| {
-            anyhow::anyhow!("Failed to decrypt file (wrong passphrase or corrupted file)")
-        })?;
+        .map_err(|_| anyhow::anyhow!("解密备份失败（密码错误或文件已损坏）"))?;
 
     let json = decompress_bytes_with_limit(&compressed, MAX_IMPORT_JSON_BYTES)
-        .context("Failed to decompress decrypted payload")?;
+        .context("解压已解密的备份失败")?;
 
-    let store: AccountsStore =
-        serde_json::from_slice(&json).context("Failed to parse decrypted account payload")?;
+    let store: AccountsStore = serde_json::from_slice(&json).context("解析已解密的账号备份失败")?;
 
     Ok(store)
 }
@@ -638,7 +575,7 @@ fn derive_encryption_key(passphrase: &str, salt: &[u8]) -> [u8; 32] {
 fn compress_bytes(input: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::best());
     encoder.write_all(input)?;
-    encoder.finish().context("Failed to finalize compression")
+    encoder.finish().context("完成压缩失败")
 }
 
 fn decompress_bytes_with_limit(input: &[u8], max_bytes: u64) -> anyhow::Result<Vec<u8>> {
@@ -648,33 +585,32 @@ fn decompress_bytes_with_limit(input: &[u8], max_bytes: u64) -> anyhow::Result<V
     limited.read_to_end(&mut decompressed)?;
 
     if decompressed.len() as u64 > max_bytes {
-        anyhow::bail!("Import data is too large");
+        anyhow::bail!("导入数据过大");
     }
 
     Ok(decompressed)
 }
 
 fn write_encrypted_file(path: &str, bytes: &[u8]) -> anyhow::Result<()> {
-    fs::write(path, bytes).with_context(|| format!("Failed to write file: {path}"))?;
+    fs::write(path, bytes).with_context(|| format!("写入文件失败：{path}"))?;
 
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("Failed to set file permissions: {path}"))?;
+            .with_context(|| format!("设置文件权限失败：{path}"))?;
     }
 
     Ok(())
 }
 
 fn read_encrypted_file(path: &str) -> anyhow::Result<Vec<u8>> {
-    let metadata =
-        fs::metadata(path).with_context(|| format!("Failed to read file metadata: {path}"))?;
+    let metadata = fs::metadata(path).with_context(|| format!("读取文件信息失败：{path}"))?;
     if metadata.len() > MAX_IMPORT_FILE_BYTES {
-        anyhow::bail!("Encrypted file is too large");
+        anyhow::bail!("加密备份文件过大");
     }
 
-    fs::read(path).with_context(|| format!("Failed to read file: {path}"))
+    fs::read(path).with_context(|| format!("读取文件失败：{path}"))
 }
 
 fn validate_imported_store(store: &AccountsStore) -> anyhow::Result<()> {
@@ -683,22 +619,22 @@ fn validate_imported_store(store: &AccountsStore) -> anyhow::Result<()> {
 
     for account in &store.accounts {
         if account.id.trim().is_empty() {
-            anyhow::bail!("Import contains an account with empty id");
+            anyhow::bail!("导入数据中有账号标识为空");
         }
         if account.name.trim().is_empty() {
-            anyhow::bail!("Import contains an account with empty name");
+            anyhow::bail!("导入数据中有账号名称为空");
         }
         if !ids.insert(account.id.clone()) {
-            anyhow::bail!("Import contains duplicate account id: {}", account.id);
+            anyhow::bail!("导入数据中存在重复账号标识：{}", account.id);
         }
         if !names.insert(account.name.clone()) {
-            anyhow::bail!("Import contains duplicate account name: {}", account.name);
+            anyhow::bail!("导入数据中存在重复账号名称：{}", account.name);
         }
     }
 
     if let Some(active_id) = &store.active_account_id {
         if !ids.contains(active_id) {
-            anyhow::bail!("Import references a missing active account: {active_id}");
+            anyhow::bail!("导入数据引用了不存在的当前账号：{active_id}");
         }
     }
 
@@ -710,7 +646,6 @@ fn merge_accounts_store(
     imported: AccountsStore,
 ) -> (AccountsStore, ImportAccountsSummary) {
     let imported_version = imported.version;
-    let imported_active_id = imported.active_account_id;
     let total_in_payload = imported.accounts.len();
     let mut imported_count = 0usize;
     let mut existing_ids: HashSet<String> = current.accounts.iter().map(|a| a.id.clone()).collect();
@@ -734,16 +669,10 @@ fn merge_accounts_store(
         .as_ref()
         .is_some_and(|id| current.accounts.iter().any(|a| &a.id == id));
 
+    // Importing a backup adds accounts only. Its selected account belongs to
+    // another session and must never become our claimed active login.
     if !current_active_is_valid {
-        if let Some(imported_active) = imported_active_id {
-            if current.accounts.iter().any(|a| a.id == imported_active) {
-                current.active_account_id = Some(imported_active);
-            } else {
-                current.active_account_id = current.accounts.first().map(|a| a.id.clone());
-            }
-        } else {
-            current.active_account_id = current.accounts.first().map(|a| a.id.clone());
-        }
+        current.active_account_id = None;
     }
 
     (
@@ -765,5 +694,68 @@ pub async fn get_masked_account_ids() -> Result<Vec<String>, String> {
 /// Set the list of masked account IDs
 #[tauri::command]
 pub async fn set_masked_account_ids(ids: Vec<String>) -> Result<(), String> {
+    let _auth_guard = AUTH_OPERATION_LOCK.lock().await;
     crate::auth::storage::set_masked_account_ids(ids).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod safe_import_tests {
+    use super::*;
+
+    #[test]
+    fn displayed_account_tracks_official_login_after_external_switch() {
+        let old = StoredAccount::new_api_key("old".into(), "synthetic-old".into());
+        let live = StoredAccount::new_api_key("live".into(), "synthetic-live".into());
+        let live_id = live.id.clone();
+        let mut store = AccountsStore {
+            active_account_id: Some(old.id.clone()),
+            accounts: vec![old, live],
+            ..AccountsStore::default()
+        };
+        let auth = AuthDotJson {
+            openai_api_key: Some("synthetic-live".into()),
+            tokens: None,
+            last_refresh: None,
+        };
+        select_live_account(&mut store, Some(&auth));
+        assert_eq!(store.active_account_id, Some(live_id));
+        select_live_account(&mut store, None);
+        assert!(store.active_account_id.is_none());
+    }
+
+    #[test]
+    fn backup_import_does_not_activate_its_selected_account() {
+        let account = StoredAccount::new_api_key("imported".into(), "synthetic-key".into());
+        let imported = AccountsStore {
+            active_account_id: Some(account.id.clone()),
+            accounts: vec![account],
+            ..AccountsStore::default()
+        };
+        let (merged, summary) = merge_accounts_store(AccountsStore::default(), imported);
+        assert_eq!(summary.imported_count, 1);
+        assert!(merged.active_account_id.is_none());
+    }
+
+    #[test]
+    fn backup_import_preserves_existing_selection() {
+        let active = StoredAccount::new_api_key("existing".into(), "synthetic-old".into());
+        let another = StoredAccount::new_api_key("imported".into(), "synthetic-new".into());
+        let active_id = active.id.clone();
+        let current = AccountsStore {
+            active_account_id: Some(active_id.clone()),
+            accounts: vec![active],
+            ..AccountsStore::default()
+        };
+        let imported = AccountsStore {
+            active_account_id: Some(another.id.clone()),
+            accounts: vec![another],
+            ..AccountsStore::default()
+        };
+        let (merged, _) = merge_accounts_store(current, imported);
+        assert_eq!(
+            merged.active_account_id.as_deref(),
+            Some(active_id.as_str())
+        );
+        assert_eq!(merged.accounts.len(), 2);
+    }
 }

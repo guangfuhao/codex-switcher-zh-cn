@@ -114,7 +114,7 @@ pub(super) fn capture_desktops(pids: &[u32]) -> Result<Vec<CapturedDesktop>, Str
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn mac_bundle_path(command: &str, name: Option<&str>) -> Option<String> {
+pub(super) fn mac_bundle_path(command: &str, name: Option<&str>) -> Option<String> {
     let suffix = match name? {
         "ChatGPT" => "/ChatGPT.app/Contents/MacOS/ChatGPT",
         "Codex" => "/Codex.app/Contents/MacOS/Codex",
@@ -146,6 +146,43 @@ fn is_codex_bundle(bundle: &str) -> bool {
                 .map(str::to_owned)
         })
         .is_some_and(|id| id == "com.openai.codex")
+}
+
+/// Ask only this captured, re-verified running desktop to terminate normally.
+/// NSRunningApplication.terminate never sends SIGKILL or starts a stopped app.
+#[cfg(target_os = "macos")]
+pub(super) fn request_macos_desktop_quit(desktop: &CapturedDesktop) -> Result<(), String> {
+    let DesktopTarget::MacBundle(bundle) = &desktop.target else {
+        return Err("无法识别桌面客户端身份，请自行退出 Codex。".into());
+    };
+    if !is_codex_bundle(bundle) {
+        return Err("已检测的应用身份不再属于 Codex，未发送关闭请求。".into());
+    }
+    const SCRIPT: &str = r#"
+ObjC.import('AppKit');
+function run(argv) {
+    const app = $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(argv[0]));
+    if (app.isNil() || ObjC.unwrap(app.bundleIdentifier) !== 'com.openai.codex' ||
+        ObjC.unwrap(app.bundleURL.path) !== argv[1]) {
+        throw new Error('The captured desktop identity changed; no close request was sent.');
+    }
+    if (!app.terminate) {
+        throw new Error('Codex did not accept a normal quit request. Close it yourself.');
+    }
+}
+"#;
+    let result = super::Command::new("/usr/bin/osascript")
+        .args(["-l", "JavaScript", "-e", SCRIPT])
+        .arg(desktop.pid.to_string())
+        .arg(bundle)
+        .output()
+        .map_err(|_| "无法请求 Codex 正常退出，请自行关闭。".to_string())?;
+    if !result.status.success() {
+        return Err(
+            "无法核验或正常关闭已检测的 Codex 桌面客户端。未尝试强制关闭，请自行退出。".into(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(any(windows, test))]
@@ -224,8 +261,13 @@ fn closed_targets(desktops: Vec<CapturedDesktop>, killed_pids: &[u32]) -> Vec<De
 pub(super) fn remember_closed_desktops(
     desktops: Vec<CapturedDesktop>,
     killed_pids: &[u32],
+    reopen_desktop: bool,
 ) -> Option<String> {
-    let targets = closed_targets(desktops, killed_pids);
+    let targets = if reopen_desktop {
+        closed_targets(desktops, killed_pids)
+    } else {
+        Vec::new()
+    };
     let mut pending = PENDING_REOPEN.lock().ok()?;
     *pending = None;
     if targets.is_empty() {
@@ -248,7 +290,7 @@ fn take_targets(
         ticket.token == token && ticket.created_at.elapsed() < Duration::from_secs(120)
     });
     if !valid {
-        return Err("The desktop reopen request expired or is no longer available".into());
+        return Err("重新打开桌面的请求已过期或失效，请手动打开 Codex".into());
     }
     Ok(pending.take().expect("validated ticket").targets)
 }
@@ -264,19 +306,20 @@ pub async fn reopen_closed_codex_desktop(token: String) -> Result<(), String> {
         let expected = targets.clone();
         for target in &targets {
             if !launch_desktop(target) {
-                return Err("Could not launch Codex desktop. The account change was not undone. Open Codex manually.".into());
+                return Err("无法启动 Codex 桌面客户端。账号已切换，请手动打开 Codex。".into());
             }
         }
-        let confirmed = wait_for_desktops(
-            &expected,
-            Duration::from_secs(20),
-            || {
-                let (pids, _) = super::find_codex_processes().map_err(|e| e.to_string())?;
-                Ok(capture_desktops(&pids)?.into_iter().map(|desktop| desktop.target).collect())
-            },
-        );
+        let confirmed = wait_for_desktops(&expected, Duration::from_secs(20), || {
+            let (pids, _) = super::find_codex_processes().map_err(|e| e.to_string())?;
+            Ok(capture_desktops(&pids)?
+                .into_iter()
+                .map(|desktop| desktop.target)
+                .collect())
+        });
         if !confirmed {
-            return Err("Codex desktop did not appear within 20 seconds. The account change was not undone. Check the app or open it manually.".into());
+            return Err(
+                "20 秒内未检测到 Codex 桌面客户端启动。账号已切换，请检查应用或手动打开。".into(),
+            );
         }
         Ok(())
     })
@@ -465,6 +508,15 @@ mod tests {
         ];
         assert_eq!(closed_targets(desktops, &[1, 2]), vec![target]);
         assert!(closed_targets(vec![], &[1]).is_empty());
+    }
+
+    #[test]
+    fn opting_out_of_reopen_never_issues_a_token_for_a_captured_closed_desktop() {
+        let desktops = vec![CapturedDesktop {
+            pid: 123,
+            target: DesktopTarget::MacBundle("/Applications/ChatGPT.app".into()),
+        }];
+        assert_eq!(remember_closed_desktops(desktops, &[123], false), None);
     }
 
     #[test]

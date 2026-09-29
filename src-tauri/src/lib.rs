@@ -31,8 +31,6 @@ pub fn run() {
         .setup(|app| {
             #[cfg(desktop)]
             {
-                app.handle()
-                    .plugin(tauri_plugin_updater::Builder::new().build())?;
                 app_menu::setup(app.handle())?;
                 tray::setup(app.handle())?;
             }
@@ -92,6 +90,8 @@ pub fn run() {
             warmup_all_accounts,
             // Process detection
             check_codex_processes,
+            commands::list_codex_process_details,
+            commands::stop_codex_process,
             kill_codex_processes,
             // Tray window
             hide_tray_window,

@@ -20,7 +20,7 @@ function emptyStats(accountId: string, error: string): AccountUsageStatsInfo {
   return {
     account_id: accountId,
     available: false,
-    source: "Codex usage stats via ChatGPT backend",
+    source: "来自 ChatGPT 的 Codex 用量统计",
     generated_at: null,
     stats_as_of: null,
     summary: {
@@ -47,36 +47,59 @@ function emptyStats(accountId: string, error: string): AccountUsageStatsInfo {
 
 function formatTokens(tokens: number | null | undefined): string {
   if (tokens === null || tokens === undefined || !Number.isFinite(tokens)) return "--";
-  const abs = Math.abs(tokens);
-  if (abs >= 1_000_000_000) return `${(tokens / 1_000_000_000).toFixed(1)}B`;
-  if (abs >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
-  if (abs >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`;
-  return `${tokens}`;
+  return new Intl.NumberFormat("zh-CN", {
+    notation: "compact",
+    maximumFractionDigits: 1,
+  }).format(tokens);
 }
 
 function formatNumber(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "--";
-  return new Intl.NumberFormat().format(value);
+  return new Intl.NumberFormat("zh-CN").format(value);
 }
 
 function formatPercent(value: number | null | undefined): string {
   if (value === null || value === undefined || !Number.isFinite(value)) return "--";
-  return `${Math.round(value)}%`;
+  return `${Math.round(value).toLocaleString("zh-CN")}%`;
+}
+
+function formatReasoningEffort(value: string | null): string {
+  if (!value) return "--";
+  const labels: Record<string, string> = {
+    none: "无", minimal: "最低", low: "低", medium: "中", high: "高",
+    xhigh: "超高", max: "最高", ultra: "极高",
+  };
+  return labels[value.toLowerCase()] ?? value;
+}
+
+function formatStatsSource(source: string | undefined): string {
+  if (!source || source === "Codex usage stats via ChatGPT backend" || source === "ChatGPT backend") {
+    return "来自 ChatGPT 的 Codex 用量统计";
+  }
+  return source;
+}
+
+function formatStatsAsOf(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric", month: "short", day: "numeric",
+  }).format(date);
 }
 
 function formatDuration(seconds: number | null | undefined): string {
   if (seconds === null || seconds === undefined || !Number.isFinite(seconds)) return "--";
-  if (seconds < 60) return `${seconds}s`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 60) return `${seconds.toLocaleString("zh-CN")} 秒`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟`;
   const hours = Math.floor(seconds / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
-  return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  return minutes > 0 ? `${hours} 小时 ${minutes} 分钟` : `${hours} 小时`;
 }
 
 function formatDateLabel(date: string): string {
   const parsed = new Date(`${date}T12:00:00`);
   if (Number.isNaN(parsed.getTime())) return date;
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(parsed);
+  return new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric" }).format(parsed);
 }
 
 function formatGeneratedAt(value: string | null): string {
@@ -84,10 +107,10 @@ function formatGeneratedAt(value: string | null): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   const diff = Date.now() - date.getTime();
-  if (diff < 60_000) return "just now";
-  if (diff < 60 * 60_000) return `${Math.floor(diff / 60_000)}m ago`;
-  if (diff < 24 * 60 * 60_000) return `${Math.floor(diff / (60 * 60_000))}h ago`;
-  return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(date);
+  if (diff < 60_000) return "刚刚";
+  if (diff < 60 * 60_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 24 * 60 * 60_000) return `${Math.floor(diff / (60 * 60_000))} 小时前`;
+  return new Intl.DateTimeFormat("zh-CN", { month: "short", day: "numeric" }).format(date);
 }
 
 function dayKey(offset: number): string {
@@ -107,10 +130,10 @@ function sumDays(daily: AccountDailyUsage[], days: number): number {
 type ActivityRange = 30 | 90 | 180 | "all";
 
 const ACTIVITY_RANGE_OPTIONS: { value: ActivityRange; label: string }[] = [
-  { value: 30, label: "30d" },
-  { value: 90, label: "3 mo" },
-  { value: 180, label: "6 mo" },
-  { value: "all", label: "All" },
+  { value: 30, label: "30 天" },
+  { value: 90, label: "3 个月" },
+  { value: 180, label: "6 个月" },
+  { value: "all", label: "全部" },
 ];
 
 function activityRangeDays(range: ActivityRange, daily: AccountDailyUsage[]): number {
@@ -121,13 +144,13 @@ function activityRangeDays(range: ActivityRange, daily: AccountDailyUsage[]): nu
 function activityRangeLabel(range: ActivityRange): string {
   switch (range) {
     case 30:
-      return "Last 30 days";
+      return "近 30 天";
     case 90:
-      return "Last 3 months";
+      return "近 3 个月";
     case 180:
-      return "Last 6 months";
+      return "近 6 个月";
     case "all":
-      return "All reported";
+      return "全部已记录数据";
   }
 }
 
@@ -171,7 +194,7 @@ function TokenActivity({ daily }: { daily: AccountDailyUsage[] }) {
   if (bars.length === 0 || !bars.some((day) => day.tokens > 0)) {
     return (
       <div className="flex h-14 items-center justify-center rounded-lg border border-dashed border-gray-200 text-[11px] text-gray-400 dark:border-gray-800 dark:text-gray-500">
-        Daily activity unavailable
+        暂无每日用量数据
       </div>
     );
   }
@@ -179,7 +202,7 @@ function TokenActivity({ daily }: { daily: AccountDailyUsage[] }) {
   return (
     <div className="rounded-lg border border-gray-200 bg-white px-3 pb-3 pt-2 dark:border-gray-800 dark:bg-gray-950/40">
       <div className="mb-2 flex items-center justify-between text-[11px]">
-        <span className="font-medium text-gray-600 dark:text-gray-300">Token activity</span>
+        <span className="font-medium text-gray-600 dark:text-gray-300">Token 用量趋势</span>
         <div className="flex items-center gap-2">
           <span className="text-gray-400 dark:text-gray-500">{activityRangeLabel(range)}</span>
           <select
@@ -189,7 +212,8 @@ function TokenActivity({ daily }: { daily: AccountDailyUsage[] }) {
               setRange(value === "all" ? "all" : (Number(value) as ActivityRange));
             }}
             className="h-6 rounded-md border border-gray-200 bg-gray-50 px-1.5 text-[11px] text-gray-600 outline-none dark:border-gray-800 dark:bg-gray-900 dark:text-gray-300"
-            aria-label="Token activity range"
+            aria-label="Token 用量统计范围"
+            title="选择图表显示近 30 天、3 个月、6 个月或全部已记录的用量"
           >
             {ACTIVITY_RANGE_OPTIONS.map((option) => (
               <option key={option.label} value={option.value}>
@@ -259,8 +283,8 @@ function DetailPanel({
       onToggle={(event) => setOpen(event.currentTarget.open)}
       className="rounded-lg border border-gray-200 bg-gray-50 transition-colors dark:border-gray-800 dark:bg-gray-950/50"
     >
-      <summary className="flex cursor-pointer list-none items-center justify-between rounded-lg px-3 py-2 text-[12px] font-semibold text-gray-700 transition-colors hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-900">
-        More usage details
+      <summary title={open ? "收起任务时长、连续使用和插件使用明细" : "展开任务时长、连续使用和插件使用明细"} className="flex cursor-pointer list-none items-center justify-between rounded-lg px-3 py-2 text-[12px] font-semibold text-gray-700 transition-colors hover:bg-gray-100 dark:text-gray-200 dark:hover:bg-gray-900">
+        更多用量详情
         <span className="flex h-6 w-6 items-center justify-center rounded-md bg-white text-gray-500 transition-colors dark:bg-gray-900 dark:text-gray-400">
           <svg
             className={`h-3.5 w-3.5 transition-transform ${open ? "rotate-180" : ""}`}
@@ -278,33 +302,33 @@ function DetailPanel({
       </summary>
       <div className="grid gap-3 border-t border-gray-200 p-3 dark:border-gray-800 sm:grid-cols-2">
         <div className="grid grid-cols-3 gap-2 sm:col-span-2">
-          <StatTile label="Last 30 days" value={formatTokens(thirtyDayTokens)} sub="reported" />
-          <StatTile label="Longest task" value={formatDuration(summary.longest_task_seconds)} />
-          <StatTile label="Longest streak" value={`${formatNumber(summary.longest_streak_days)} days`} />
+          <StatTile label="近 30 天" value={formatTokens(thirtyDayTokens)} sub="已记录" />
+          <StatTile label="最长任务时长" value={formatDuration(summary.longest_task_seconds)} />
+          <StatTile label="最长连续使用" value={`${formatNumber(summary.longest_streak_days)} 天`} />
         </div>
 
         {hasActivity && (
           <div className="space-y-1.5">
             <div className="mb-1 text-[11px] font-semibold text-gray-600 dark:text-gray-300">
-              Activity insights
+              使用习惯
             </div>
             <div className="flex justify-between gap-2 text-[11px]">
-              <span className="text-gray-500 dark:text-gray-400">Fast mode</span>
+              <span className="text-gray-500 dark:text-gray-400">快速模式</span>
               <span className="text-gray-800 dark:text-gray-100">{formatPercent(activity.fast_mode_percent)}</span>
             </div>
             <div className="flex justify-between gap-2 text-[11px]">
-              <span className="text-gray-500 dark:text-gray-400">Reasoning</span>
+              <span className="text-gray-500 dark:text-gray-400">推理强度</span>
               <span className="text-gray-800 dark:text-gray-100">
-                {activity.reasoning_effort ?? "--"}
+                {formatReasoningEffort(activity.reasoning_effort)}
                 {activity.reasoning_effort_percent !== null && ` · ${formatPercent(activity.reasoning_effort_percent)}`}
               </span>
             </div>
             <div className="flex justify-between gap-2 text-[11px]">
-              <span className="text-gray-500 dark:text-gray-400">Skills explored</span>
+              <span className="text-gray-500 dark:text-gray-400">使用过的技能</span>
               <span className="text-gray-800 dark:text-gray-100">{formatNumber(activity.skills_explored)}</span>
             </div>
             <div className="flex justify-between gap-2 text-[11px]">
-              <span className="text-gray-500 dark:text-gray-400">Total threads</span>
+              <span className="text-gray-500 dark:text-gray-400">累计对话数</span>
               <span className="text-gray-800 dark:text-gray-100">{formatNumber(activity.total_threads)}</span>
             </div>
           </div>
@@ -313,7 +337,7 @@ function DetailPanel({
         {topInvocations.length > 0 && (
           <div className="space-y-1.5">
             <div className="mb-1 text-[11px] font-semibold text-gray-600 dark:text-gray-300">
-              Most used plugins
+              常用插件
             </div>
             {topInvocations.slice(0, 5).map((invocation) => (
               <InvocationRow
@@ -336,7 +360,7 @@ function InvocationRow({ invocation }: { invocation: AccountTopInvocation }) {
         {prefix}{invocation.display_name}
       </span>
       <span className="shrink-0 text-gray-500 dark:text-gray-400">
-        {formatNumber(invocation.usage_count)} runs
+        {formatNumber(invocation.usage_count)} 次
       </span>
     </div>
   );
@@ -362,7 +386,7 @@ export function AccountUsageStats({
 
     if (!enabled) {
       if (background) return;
-      const next = emptyStats(accountId, "Usage stats are available for ChatGPT accounts only.");
+      const next = emptyStats(accountId, "仅 ChatGPT 账号支持用量统计。");
       setStats(next);
       onStatsLoaded?.(next);
       setLoading(false);
@@ -423,17 +447,20 @@ export function AccountUsageStats({
       <div>
         <div className="mb-3 flex items-center justify-between gap-3">
           <p className="truncate text-[11px] text-gray-500 dark:text-gray-400">
-            {currentStats?.stats_as_of ? `Stats as of ${currentStats.stats_as_of}` : currentStats?.source ?? "ChatGPT backend"}
-            {generatedAt && ` · updated ${generatedAt}`}
+            {currentStats?.stats_as_of ? `统计截至 ${formatStatsAsOf(currentStats.stats_as_of)}` : formatStatsSource(currentStats?.source)}
+            {generatedAt && ` · 更新于 ${generatedAt}`}
           </p>
+          <span className="inline-flex shrink-0" title={!enabled ? "仅 ChatGPT 账号支持详细用量统计" : loading ? "正在获取详细统计，请稍候" : "重新获取此账号的详细用量统计"}>
           <button
             onClick={() => void loadStats()}
             disabled={loading || !enabled}
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gray-100 text-gray-600 transition-colors hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
-            title="Refresh usage stats"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-gray-100 text-gray-600 transition-colors hover:bg-gray-200 disabled:opacity-50 disabled:pointer-events-none dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
+            title="重新获取此账号的详细用量统计"
+            aria-label="刷新详细用量统计"
           >
             <span className={loading ? "inline-block animate-spin" : ""}>↻</span>
           </button>
+          </span>
         </div>
 
         {loading && !currentStats ? (
@@ -445,11 +472,11 @@ export function AccountUsageStats({
         ) : currentStats?.available ? (
           <div className="space-y-3">
             <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
-              <StatTile label="Lifetime" value={formatTokens(currentStats.summary.lifetime_tokens)} sub="tokens" />
-              <StatTile label="Today" value={formatTokens(todayTokens)} sub="reported" />
-              <StatTile label="Last 7 days" value={formatTokens(sevenDayTokens)} sub="reported" />
-              <StatTile label="Current streak" value={`${formatNumber(currentStats.summary.current_streak_days)} days`} />
-              <StatTile label="Peak day" value={formatTokens(currentStats.summary.peak_daily_tokens)} sub="tokens" />
+              <StatTile label="累计用量" value={formatTokens(currentStats.summary.lifetime_tokens)} sub="Token" />
+              <StatTile label="今日" value={formatTokens(todayTokens)} sub="已记录" />
+              <StatTile label="近 7 天" value={formatTokens(sevenDayTokens)} sub="已记录" />
+              <StatTile label="连续使用" value={`${formatNumber(currentStats.summary.current_streak_days)} 天`} />
+              <StatTile label="单日峰值" value={formatTokens(currentStats.summary.peak_daily_tokens)} sub="Token" />
             </div>
 
             <TokenActivity daily={currentStats.daily} />
@@ -463,7 +490,7 @@ export function AccountUsageStats({
           </div>
         ) : (
           <div className="rounded-lg border border-dashed border-gray-200 px-3 py-3 text-xs text-gray-500 dark:border-gray-800 dark:text-gray-400">
-            {currentStats?.error ?? "Usage stats unavailable."}
+            {currentStats?.error ? `用量统计获取失败：${currentStats.error}` : "暂无用量统计。"}
           </div>
         )}
       </div>

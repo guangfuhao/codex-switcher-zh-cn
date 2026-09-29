@@ -12,12 +12,16 @@ use crate::types::{
 
 /// Get the official Codex home directory
 pub fn get_codex_home() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(directory) = std::env::var_os("CODEX_SWITCHER_TEST_CODEX_DIR") {
+        return Ok(PathBuf::from(directory));
+    }
     // Check for CODEX_HOME environment variable first
     if let Ok(codex_home) = std::env::var("CODEX_HOME") {
         return Ok(PathBuf::from(codex_home));
     }
 
-    let home = dirs::home_dir().context("Could not find home directory")?;
+    let home = dirs::home_dir().context("无法找到用户主目录")?;
     Ok(home.join(".codex"))
 }
 
@@ -32,16 +36,15 @@ pub fn switch_to_account(account: &StoredAccount) -> Result<()> {
 
     // Ensure the codex home directory exists
     fs::create_dir_all(&codex_home)
-        .with_context(|| format!("Failed to create codex home: {}", codex_home.display()))?;
+        .with_context(|| format!("创建 Codex 配置目录失败：{}", codex_home.display()))?;
 
     let auth_json = create_auth_json(account)?;
 
     let auth_path = codex_home.join("auth.json");
-    let content =
-        serde_json::to_string_pretty(&auth_json).context("Failed to serialize auth.json")?;
+    let content = serde_json::to_string_pretty(&auth_json).context("生成 Codex 登录文件失败")?;
 
     fs::write(&auth_path, content)
-        .with_context(|| format!("Failed to write auth.json: {}", auth_path.display()))?;
+        .with_context(|| format!("写入 Codex 登录文件失败：{}", auth_path.display()))?;
 
     // Set restrictive permissions on Unix
     #[cfg(unix)]
@@ -83,10 +86,10 @@ fn create_auth_json(account: &StoredAccount) -> Result<AuthDotJson> {
 /// Import an account from an existing auth.json file
 pub fn import_from_auth_json(path: &str, account_name: String) -> Result<StoredAccount> {
     let content =
-        fs::read_to_string(path).with_context(|| format!("Failed to read auth.json: {path}"))?;
+        fs::read_to_string(path).with_context(|| format!("读取 Codex 登录文件失败：{path}"))?;
 
     import_from_auth_json_contents(&content, account_name)
-        .with_context(|| format!("Failed to parse auth.json: {path}"))
+        .with_context(|| format!("解析 Codex 登录文件失败：{path}"))
 }
 
 /// Import an account from auth.json file contents.
@@ -95,7 +98,7 @@ pub fn import_from_auth_json_contents(
     account_name: String,
 ) -> Result<StoredAccount> {
     let auth: AuthDotJson =
-        serde_json::from_str(&content).context("Failed to parse auth.json contents")?;
+        serde_json::from_str(&content).context("解析 Codex 登录文件内容失败")?;
     let account_name = account_name.trim().to_string();
 
     // Determine auth mode and create account
@@ -115,7 +118,7 @@ pub fn import_from_auth_json_contents(
             claims.account_id.or(tokens.account_id),
         ))
     } else {
-        anyhow::bail!("auth.json contains neither API key nor tokens");
+        anyhow::bail!("登录文件中没有 API 密钥或登录凭据");
     }
 }
 
@@ -128,10 +131,10 @@ pub fn read_current_auth() -> Result<Option<AuthDotJson>> {
     }
 
     let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read auth.json: {}", path.display()))?;
+        .with_context(|| format!("读取 Codex 登录文件失败：{}", path.display()))?;
 
     let auth: AuthDotJson = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse auth.json: {}", path.display()))?;
+        .with_context(|| format!("解析 Codex 登录文件失败：{}", path.display()))?;
 
     Ok(Some(auth))
 }

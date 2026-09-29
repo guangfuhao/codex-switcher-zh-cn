@@ -4,6 +4,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use base64::Engine;
 use chrono::{DateTime, Utc};
 
 use crate::types::{
@@ -14,13 +15,107 @@ pub fn sync_active_account_tokens(store: &mut AccountsStore, auth: &AuthDotJson)
     let Some(active_id) = store.active_account_id.as_deref() else {
         return false;
     };
-    let Some(tokens) = auth.tokens.as_ref() else {
-        return false;
-    };
     let Some(account) = store
         .accounts
         .iter_mut()
         .find(|account| account.id == active_id)
+    else {
+        return false;
+    };
+
+    sync_account_tokens(account, auth)
+}
+
+/// Match the actual Codex login, independently of the switcher's selected row.
+pub(crate) fn auth_matches_account(account: &StoredAccount, auth: &AuthDotJson) -> bool {
+    match &account.auth_data {
+        AuthData::ApiKey { key } => {
+            !key.is_empty() && auth.tokens.is_none() && auth.openai_api_key.as_ref() == Some(key)
+        }
+        AuthData::ChatGPT {
+            id_token,
+            account_id,
+            ..
+        } => {
+            if auth.openai_api_key.is_some() {
+                return false;
+            }
+            let Some(tokens) = auth.tokens.as_ref() else {
+                return false;
+            };
+            let Some((stored_id, stored_subject)) =
+                chatgpt_identity(id_token, account_id.as_deref())
+            else {
+                return false;
+            };
+            let Some((live_id, live_subject)) =
+                chatgpt_identity(&tokens.id_token, tokens.account_id.as_deref())
+            else {
+                return false;
+            };
+            stored_id == live_id
+                && match (stored_subject, live_subject) {
+                    (Some(stored), Some(live)) => stored == live,
+                    _ => true,
+                }
+        }
+    }
+}
+
+fn chatgpt_identity(id_token: &str, account_id: Option<&str>) -> Option<(String, Option<String>)> {
+    let claimed_id = parse_chatgpt_id_token_claims(id_token)
+        .account_id
+        .filter(|id| !id.trim().is_empty());
+    let account_id = account_id.filter(|id| !id.trim().is_empty());
+    if let (Some(claimed), Some(explicit)) = (claimed_id.as_deref(), account_id) {
+        if claimed != explicit {
+            return None;
+        }
+    }
+    let resolved_id = claimed_id.or_else(|| account_id.map(String::from))?;
+    let parts: Vec<_> = id_token.split('.').collect();
+    let subject = if parts.len() == 3 {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(parts[1])
+            .ok()
+            .and_then(|payload| serde_json::from_slice::<serde_json::Value>(&payload).ok())
+            .and_then(|claims| {
+                claims
+                    .get("sub")
+                    .and_then(|value| value.as_str())
+                    .map(String::from)
+            })
+            .filter(|subject| !subject.trim().is_empty())
+    } else {
+        None
+    };
+    Some((resolved_id, subject))
+}
+
+/// Preserve live token rotations for every matching saved copy, without selecting it.
+pub(crate) fn sync_matching_account_tokens(store: &mut AccountsStore, auth: &AuthDotJson) -> bool {
+    let mut changed = false;
+    for account in &mut store.accounts {
+        changed |= sync_account_tokens(account, auth);
+    }
+    changed
+}
+
+fn sync_account_tokens(account: &mut StoredAccount, auth: &AuthDotJson) -> bool {
+    if !auth_matches_account(account, auth) {
+        return false;
+    }
+    let Some(tokens) = auth.tokens.as_ref() else {
+        return false;
+    };
+    if tokens.id_token.is_empty()
+        || tokens.access_token.is_empty()
+        || tokens.refresh_token.is_empty()
+    {
+        return false;
+    }
+    let Some((current_account_id, _)) =
+        chatgpt_identity(&tokens.id_token, tokens.account_id.as_deref())
     else {
         return false;
     };
@@ -33,21 +128,6 @@ pub fn sync_active_account_tokens(store: &mut AccountsStore, auth: &AuthDotJson)
     else {
         return false;
     };
-
-    let stored_account_id = parse_chatgpt_id_token_claims(id_token)
-        .account_id
-        .or_else(|| account_id.clone());
-    let current_account_id = parse_chatgpt_id_token_claims(&tokens.id_token)
-        .account_id
-        .or_else(|| tokens.account_id.clone());
-    let (Some(stored_account_id), Some(current_account_id)) =
-        (stored_account_id, current_account_id)
-    else {
-        return false;
-    };
-    if stored_account_id != current_account_id {
-        return false;
-    }
 
     let changed = *id_token != tokens.id_token
         || *access_token != tokens.access_token
@@ -66,7 +146,11 @@ pub fn sync_active_account_tokens(store: &mut AccountsStore, auth: &AuthDotJson)
 
 /// Get the path to the codex-switcher config directory
 pub fn get_config_dir() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("Could not find home directory")?;
+    #[cfg(test)]
+    if let Some(directory) = std::env::var_os("CODEX_SWITCHER_TEST_CONFIG_DIR") {
+        return Ok(PathBuf::from(directory));
+    }
+    let home = dirs::home_dir().context("无法找到用户主目录")?;
     Ok(home.join(".codex-switcher"))
 }
 
@@ -88,10 +172,10 @@ pub fn load_accounts() -> Result<AccountsStore> {
     }
 
     let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read accounts file: {}", path.display()))?;
+        .with_context(|| format!("读取账号文件失败：{}", path.display()))?;
 
     let store: AccountsStore = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse accounts file: {}", path.display()))?;
+        .with_context(|| format!("解析账号文件失败：{}", path.display()))?;
 
     Ok(store)
 }
@@ -104,10 +188,10 @@ pub fn load_app_settings() -> Result<AppSettings> {
     }
 
     let content = fs::read_to_string(&path)
-        .with_context(|| format!("Failed to read settings file: {}", path.display()))?;
+        .with_context(|| format!("读取设置文件失败：{}", path.display()))?;
 
     let settings: AppSettings = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse settings file: {}", path.display()))?;
+        .with_context(|| format!("解析设置文件失败：{}", path.display()))?;
 
     Ok(settings)
 }
@@ -117,12 +201,11 @@ pub fn save_app_settings(settings: &AppSettings) -> Result<()> {
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+            .with_context(|| format!("创建配置目录失败：{}", parent.display()))?;
     }
 
-    let content = serde_json::to_string_pretty(settings).context("Failed to serialize settings")?;
-    fs::write(&path, content)
-        .with_context(|| format!("Failed to write settings file: {}", path.display()))?;
+    let content = serde_json::to_string_pretty(settings).context("生成设置数据失败")?;
+    fs::write(&path, content).with_context(|| format!("保存设置失败：{}", path.display()))?;
 
     #[cfg(unix)]
     {
@@ -141,14 +224,12 @@ pub fn save_accounts(store: &AccountsStore) -> Result<()> {
     // Ensure the config directory exists
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
+            .with_context(|| format!("创建配置目录失败：{}", parent.display()))?;
     }
 
-    let content =
-        serde_json::to_string_pretty(store).context("Failed to serialize accounts store")?;
+    let content = serde_json::to_string_pretty(store).context("生成账号数据失败")?;
 
-    fs::write(&path, content)
-        .with_context(|| format!("Failed to write accounts file: {}", path.display()))?;
+    fs::write(&path, content).with_context(|| format!("保存账号文件失败：{}", path.display()))?;
 
     // Set restrictive permissions on Unix
     #[cfg(unix)]
@@ -161,22 +242,17 @@ pub fn save_accounts(store: &AccountsStore) -> Result<()> {
     Ok(())
 }
 
-/// Add a new account to the store
+/// Save a new account without changing the account selected for Codex.
 pub fn add_account(account: StoredAccount) -> Result<StoredAccount> {
     let mut store = load_accounts()?;
 
     // Check for duplicate names
     if store.accounts.iter().any(|a| a.name == account.name) {
-        anyhow::bail!("An account with name '{}' already exists", account.name);
+        anyhow::bail!("已存在名为“{}”的账号", account.name);
     }
 
     let account_clone = account.clone();
     store.accounts.push(account);
-
-    // If this is the first account, make it active
-    if store.accounts.len() == 1 {
-        store.active_account_id = Some(account_clone.id.clone());
-    }
 
     save_accounts(&store)?;
     Ok(account_clone)
@@ -190,12 +266,12 @@ pub fn remove_account(account_id: &str) -> Result<()> {
     store.accounts.retain(|a| a.id != account_id);
 
     if store.accounts.len() == initial_len {
-        anyhow::bail!("Account not found: {account_id}");
+        anyhow::bail!("找不到账号：{account_id}");
     }
 
-    // If we removed the active account, clear it or set to first available
+    // Removing a saved login must not pretend another account was switched in.
     if store.active_account_id.as_deref() == Some(account_id) {
-        store.active_account_id = store.accounts.first().map(|a| a.id.clone());
+        store.active_account_id = None;
     }
 
     save_accounts(&store)?;
@@ -208,7 +284,7 @@ pub fn set_active_account(account_id: &str) -> Result<()> {
 
     // Verify the account exists
     if !store.accounts.iter().any(|a| a.id == account_id) {
-        anyhow::bail!("Account not found: {account_id}");
+        anyhow::bail!("找不到账号：{account_id}");
     }
 
     store.active_account_id = Some(account_id.to_string());
@@ -261,7 +337,7 @@ pub fn update_account_metadata(
             .iter()
             .any(|a| a.id != account_id && a.name == *new_name)
         {
-            anyhow::bail!("An account with name '{new_name}' already exists");
+            anyhow::bail!("已存在名为“{new_name}”的账号");
         }
     }
 
@@ -270,7 +346,7 @@ pub fn update_account_metadata(
         .accounts
         .iter_mut()
         .find(|a| a.id == account_id)
-        .context("Account not found")?;
+        .context("找不到账号")?;
 
     let mut changed = false;
 
@@ -327,7 +403,7 @@ pub fn update_account_chatgpt_tokens(
         .accounts
         .iter_mut()
         .find(|a| a.id == account_id)
-        .context("Account not found")?;
+        .context("找不到账号")?;
 
     match &mut account.auth_data {
         AuthData::ChatGPT {
@@ -344,7 +420,7 @@ pub fn update_account_chatgpt_tokens(
             }
         }
         AuthData::ApiKey { .. } => {
-            anyhow::bail!("Cannot update OAuth tokens for an API key account");
+            anyhow::bail!("API 密钥账号不支持更新 OAuth 登录凭据");
         }
     }
 
@@ -381,7 +457,7 @@ pub fn set_masked_account_ids(ids: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::sync_active_account_tokens;
+    use super::{auth_matches_account, sync_active_account_tokens, sync_matching_account_tokens};
     use crate::types::{AccountsStore, AuthData, AuthDotJson, StoredAccount, TokenData};
     use base64::Engine;
 
@@ -423,6 +499,80 @@ mod tests {
             format!(r#"{{"https://api.openai.com/auth":{{"chatgpt_account_id":"{account_id}"}}}}"#);
         let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload);
         format!("header.{encoded}.{suffix}")
+    }
+
+    fn id_token_with_subject(account_id: &str, subject: &str) -> String {
+        let payload = serde_json::json!({
+            "sub": subject,
+            "https://api.openai.com/auth": {"chatgpt_account_id": account_id},
+        });
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload.to_string());
+        format!("header.{encoded}.synthetic-signature")
+    }
+
+    #[test]
+    fn matches_live_account_without_relying_on_selected_row() {
+        let first = account("First copy", "workspace-a", "old");
+        let second = account("Second copy", "workspace-a", "older");
+        let unrelated = account("Other", "workspace-b", "other");
+        let mut store = AccountsStore {
+            accounts: vec![first, second, unrelated],
+            active_account_id: None,
+            ..AccountsStore::default()
+        };
+
+        assert!(sync_matching_account_tokens(
+            &mut store,
+            &auth("workspace-a", "rotated")
+        ));
+        assert_eq!(store.active_account_id, None);
+        assert_eq!(refresh_token(&store.accounts[0]), "refresh-rotated");
+        assert_eq!(refresh_token(&store.accounts[1]), "refresh-rotated");
+        assert_eq!(refresh_token(&store.accounts[2]), "refresh-other");
+    }
+
+    #[test]
+    fn shared_workspace_does_not_mix_different_jwt_subjects() {
+        let mut saved = account("Saved", "shared-workspace", "saved");
+        let AuthData::ChatGPT { id_token, .. } = &mut saved.auth_data else {
+            panic!("expected ChatGPT account");
+        };
+        *id_token = id_token_with_subject("shared-workspace", "user-a");
+        let mut live = auth("shared-workspace", "live");
+        live.tokens.as_mut().unwrap().id_token =
+            id_token_with_subject("shared-workspace", "user-b");
+
+        assert!(!auth_matches_account(&saved, &live));
+        live.tokens.as_mut().unwrap().id_token =
+            id_token_with_subject("shared-workspace", "user-a");
+        assert!(auth_matches_account(&saved, &live));
+    }
+
+    #[test]
+    fn conflicting_account_ids_cannot_match_or_replace_stored_tokens() {
+        let saved = account("Saved", "workspace-a", "saved");
+        let mut live = auth("workspace-b", "live");
+        live.tokens.as_mut().unwrap().id_token = id_token_with_account_id("workspace-a", "live");
+        let mut store = AccountsStore {
+            accounts: vec![saved],
+            ..AccountsStore::default()
+        };
+
+        assert!(!auth_matches_account(&store.accounts[0], &live));
+        assert!(!sync_matching_account_tokens(&mut store, &live));
+        assert_eq!(refresh_token(&store.accounts[0]), "refresh-saved");
+    }
+
+    #[test]
+    fn incomplete_live_tokens_do_not_erase_saved_credentials() {
+        let mut live = auth("workspace-a", "live");
+        live.tokens.as_mut().unwrap().refresh_token.clear();
+        let mut store = AccountsStore {
+            accounts: vec![account("Saved", "workspace-a", "saved")],
+            ..AccountsStore::default()
+        };
+        assert!(!sync_matching_account_tokens(&mut store, &live));
+        assert_eq!(refresh_token(&store.accounts[0]), "refresh-saved");
     }
 
     #[test]

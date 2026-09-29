@@ -37,12 +37,12 @@ export function formatResetCreditDateTime(
   expiresAt: string | null,
   options: ResetCreditDateTimeFormatOptions = {},
 ): string {
-  if (!expiresAt) return "No expiry";
+  if (!expiresAt) return "无到期时间";
 
   const expiry = new Date(expiresAt);
-  if (Number.isNaN(expiry.getTime())) return "Expiry unavailable";
+  if (Number.isNaN(expiry.getTime())) return "到期时间不可用";
 
-  return new Intl.DateTimeFormat(options.locale, {
+  return new Intl.DateTimeFormat(options.locale ?? "zh-CN", {
     month: "short",
     day: "numeric",
     ...(options.compact ? {} : { year: "numeric" }),

@@ -5,7 +5,7 @@ import { useDesktopReopen } from "./hooks/useDesktopReopen";
 import { useCodexClosePreference } from "./hooks/useCodexClosePreference";
 import { SettingsModal } from "./components/SettingsModal";
 import { finishForceClose, type DesktopReopenPreference } from "./lib/desktopReopen";
-import type { CodexClosePreference } from "./lib/codexClosePreference";
+import { canCloseCodexDesktop, type CodexClosePreference } from "./lib/codexClosePreference";
 import { useForceCloseCodexProcesses } from "./hooks/useForceCloseCodexProcesses";
 import { AccountCard, AddAccountModal, UpdateChecker } from "./components";
 import type { AccountWithUsage, CodexProcessInfo, DockDisplayMode, UsageInfo } from "./types";
@@ -42,6 +42,8 @@ import {
   type AutoWarmupWindow,
   type AutoWarmupWindowKind,
 } from "./lib/autoWarmupPolicy";
+import { ProcessPanel } from "./components/ProcessPanel";
+import { HoverHelp } from "./components/HoverHelp";
 import "./App.css";
 
 const AUTO_WARMUP_CHECK_INTERVAL_MS = 30 * 1000;
@@ -248,6 +250,7 @@ function App() {
   const [isActionsMenuOpen, setIsActionsMenuOpen] = useState(false);
   const [isNavMenuOpen, setIsNavMenuOpen] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isProcessPanelOpen, setIsProcessPanelOpen] = useState(false);
   const [isCompletingForceClose, setIsCompletingForceClose] = useState(false);
   const toastTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const forceCloseInFlightRef = useRef(false);
@@ -432,6 +435,7 @@ function App() {
           prev.can_switch === info.can_switch &&
           prev.count === info.count &&
           prev.background_count === info.background_count &&
+          prev.external_count === info.external_count &&
           prev.pids.length === info.pids.length &&
           prev.pids.every((pid, index) => pid === info.pids[index])
         ) {
@@ -555,7 +559,7 @@ function App() {
       setSwitchingId(accountId);
       const latestProcessInfo = await checkProcesses();
       if (!latestProcessInfo) {
-        showWarmupToast("Could not check running Codex processes. Try again.", true);
+        showWarmupToast("无法检查正在运行的 Codex 服务，请重试。", true);
         return;
       }
       if (!latestProcessInfo.can_switch) {
@@ -572,7 +576,7 @@ function App() {
         setPendingSwitchAccountId(accountId);
         setForceCloseConfirmOpen(true);
       } else {
-        showWarmupToast(`Switch failed: ${formatWarmupError(err)}`, true);
+        showWarmupToast(`切换失败： ${formatWarmupError(err)}`, true);
       }
     } finally {
       setSwitchingId(null);
@@ -613,13 +617,16 @@ function App() {
   }, []);
 
   const formatWarmupError = useCallback((err: unknown) => {
-    if (!err) return "Unknown error";
-    if (err instanceof Error && err.message) return err.message;
-    if (typeof err === "string") return err;
+    if (!err) return "未知错误";
+    const message = err instanceof Error ? err.message : typeof err === "string" ? err : null;
+    if (message?.startsWith("Cannot switch accounts while ")) {
+      return "仍有 Codex 服务在运行，请先在服务面板中处理后再切换。";
+    }
+    if (message) return message;
     try {
       return JSON.stringify(err);
     } catch {
-      return "Unknown error";
+      return "未知错误";
     }
   }, []);
 
@@ -660,14 +667,14 @@ function App() {
     try {
       desktopReopen.savePreference(value);
     } catch (err) {
-      showWarmupToast(`Could not save preference: ${formatWarmupError(err)}`, true);
+      showWarmupToast(`无法保存偏好设置： ${formatWarmupError(err)}`, true);
     }
   };
   const saveCodexClosePreference = (value: CodexClosePreference) => {
     try {
       codexClose.savePreference(value);
     } catch (err) {
-      showWarmupToast(`Could not save close preference: ${formatWarmupError(err)}`, true);
+      showWarmupToast(`无法保存关闭偏好： ${formatWarmupError(err)}`, true);
     }
   };
 
@@ -698,10 +705,10 @@ function App() {
               setSwitchingId(accountId);
               await switchAccount(accountId);
               setPendingSwitchAccountId(null);
-              showWarmupToast("Switched account from tray.");
+              showWarmupToast("已通过菜单栏切换账号。");
             } catch (err) {
               console.error("Failed to retry tray account switch:", err);
-              showWarmupToast(`Switch failed: ${formatWarmupError(err)}`, true);
+              showWarmupToast(`切换失败： ${formatWarmupError(err)}`, true);
             } finally {
               setSwitchingId(null);
             }
@@ -709,7 +716,7 @@ function App() {
           }
 
           showWarmupToast(
-            event.payload?.error || "Account switch was blocked.",
+            event.payload?.error ? formatWarmupError(event.payload.error) : "当前状态不允许切换账号。",
             true
           );
         }
@@ -753,7 +760,7 @@ function App() {
         setCloseBehaviorPromptOpen(false);
       } catch (err) {
         console.error("Failed to complete close behavior:", err);
-        showWarmupToast(`Close failed: ${formatWarmupError(err)}`, true);
+        showWarmupToast(`关闭失败： ${formatWarmupError(err)}`, true);
       } finally {
         setIsCompletingCloseBehavior(false);
       }
@@ -762,7 +769,7 @@ function App() {
   );
 
   const handleForceCloseConfirm = async () => {
-    if (forceCloseInFlightRef.current || desktopReopen.checking) return;
+    if (forceCloseInFlightRef.current || desktopReopen.checking || !canCloseCodexDesktop(processInfo)) return;
     forceCloseInFlightRef.current = true;
     const accountId = pendingSwitchAccountId;
     const shouldReopen = desktopReopen.available && desktopReopen.reopen;
@@ -771,38 +778,38 @@ function App() {
       try {
         desktopReopen.rememberSelection();
       } catch (err) {
-        showWarmupToast(`Could not save preference: ${formatWarmupError(err)}`, true);
+        showWarmupToast(`无法保存偏好设置： ${formatWarmupError(err)}`, true);
       }
       try {
         codexClose.rememberSelection();
       } catch (err) {
-        showWarmupToast(`Could not save close preference: ${formatWarmupError(err)}`, true);
+        showWarmupToast(`无法保存关闭偏好： ${formatWarmupError(err)}`, true);
       }
-      const result = await closeCodexProcesses(shouldReopen, codexClose.forceClose);
+      const result = await closeCodexProcesses(shouldReopen);
       if (!result?.processInfo?.can_switch) return;
 
       await finishForceClose(
-        { canSwitch: true, reopenToken: result.reopenToken },
+        { canSwitch: true, reopenToken: shouldReopen ? result.reopenToken : null },
         accountId ? async () => {
           setSwitchingId(accountId);
           await switchAccount(accountId);
-          showWarmupToast(`Switched account after ${codexClose.forceClose ? "force closing" : "closing"} Codex.`);
+          showWarmupToast("已关闭 Codex 桌面并切换账号。");
         } : null,
         async (token) => {
           try {
             await invokeBackend("reopen_closed_codex_desktop", { token });
-            showWarmupToast(accountId ? "Account switched. Codex desktop reopened." : "Codex desktop reopened.");
+            showWarmupToast(accountId ? "账号已切换，Codex 桌面已重新打开。" : "Codex 桌面已重新打开。");
           } catch (err) {
-            showWarmupToast(`Codex closed${accountId ? " and account switched" : ""}, but reopening failed: ${formatWarmupError(err)}`, true);
+            showWarmupToast(`Codex 已关闭${accountId ? "，账号已切换" : ""}，但重新打开失败：${formatWarmupError(err)}`, true);
           }
         },
       );
       if (shouldReopen && !result.reopenToken) {
-        showWarmupToast("No closed desktop app could be identified for reopening. Open Codex manually.", true);
+        showWarmupToast("未能识别刚关闭的桌面应用，请手动打开 Codex。", true);
       }
     } catch (err) {
       console.error("Failed to switch account after closing Codex:", err);
-      showWarmupToast(`Switch failed after closing Codex: ${formatWarmupError(err)}`, true);
+      showWarmupToast(`Codex 已关闭，但账号切换失败： ${formatWarmupError(err)}`, true);
     } finally {
       setPendingSwitchAccountId(null);
       setSwitchingId(null);
@@ -817,11 +824,11 @@ function App() {
       setWarmingUpId(accountId);
       await warmupAccount(accountId);
       markSuccessfulWarmup(accountId);
-      showWarmupToast(`Warm-up sent for ${accountName}`);
+      showWarmupToast(`已向 ${accountName} 发送预热请求`);
     } catch (err) {
       console.error("Failed to warm up account:", err);
       showWarmupToast(
-        `Warm-up failed for ${accountName}: ${formatWarmupError(err)}`,
+        `${accountName} 预热失败：${formatWarmupError(err)}`,
         true
       );
     } finally {
@@ -834,7 +841,7 @@ function App() {
       setIsWarmingAll(true);
       const summary = await warmupAllAccounts();
       if (summary.total_accounts === 0) {
-        showWarmupToast("No accounts available for warm-up", true);
+        showWarmupToast("暂无可预热的账号", true);
         return;
       }
 
@@ -848,19 +855,17 @@ function App() {
 
       if (summary.failed_account_ids.length === 0) {
         showWarmupToast(
-          `Warm-up sent for all ${summary.warmed_accounts} account${
-            summary.warmed_accounts === 1 ? "" : "s"
-          }`
+          `已向全部 ${summary.warmed_accounts} 个账号发送预热请求`
         );
       } else {
         showWarmupToast(
-          `Warmed ${summary.warmed_accounts}/${summary.total_accounts}. Failed: ${summary.failed_account_ids.length}`,
+          `预热成功 ${summary.warmed_accounts}/${summary.total_accounts} 个，失败 ${summary.failed_account_ids.length} 个`,
           true
         );
       }
     } catch (err) {
       console.error("Failed to warm up all accounts:", err);
-      showWarmupToast(`Warm-up all failed: ${formatWarmupError(err)}`, true);
+      showWarmupToast(`批量预热失败： ${formatWarmupError(err)}`, true);
     } finally {
       setIsWarmingAll(false);
     }
@@ -888,9 +893,9 @@ function App() {
   const formatWindowDuration = (minutes: number | null | undefined): string => {
     if (!minutes || minutes <= 0) return "";
     if (minutes < 24 * 60) {
-      return `${Math.ceil(minutes / 60)}h`;
+      return `${Math.ceil(minutes / 60)} 小时`;
     }
-    return `${Math.ceil(minutes / (24 * 60))}d`;
+    return `${Math.ceil(minutes / (24 * 60))} 天`;
   };
 
   const getAutoWarmupLabel = useCallback(
@@ -899,32 +904,32 @@ function App() {
       isEnabled: boolean,
       isRunning: boolean
     ) => {
-      if (isRunning) return "Warming...";
-      if (!isEnabled) return "off";
-      if (!usage || usage.error) return "on";
+      if (isRunning) return "正在预热…";
+      if (!isEnabled) return "已关闭";
+      if (!usage || usage.error) return "已开启";
 
       const windowKind = getAutoWarmupWindowKind(usage);
       if (windowKind === "session" && isLimitFull(usage.secondary_used_percent)) {
         const weeklyDuration = formatWindowDuration(usage.secondary_window_minutes);
-        return weeklyDuration ? `Waiting ${weeklyDuration}` : "Waiting reset";
+        return weeklyDuration ? `等待 ${weeklyDuration} 额度重置` : "等待额度重置";
       }
       if (windowKind === "session") {
-        return formatWindowDuration(usage.primary_window_minutes) || "5h";
+        return formatWindowDuration(usage.primary_window_minutes) || "5 小时";
       }
       if (windowKind === "weekly") {
-        return formatWindowDuration(usage.secondary_window_minutes) || "7d";
+        return formatWindowDuration(usage.secondary_window_minutes) || "7 天";
       }
 
-      return "on";
+      return "已开启";
     },
     []
   );
 
   const headerAutoWarmupLabel = useMemo(() => {
-    if (autoWarmupRunningIds.size > 0) return "Auto warming...";
+    if (autoWarmupRunningIds.size > 0) return "正在自动预热…";
     return autoWarmupAllEnabled || autoWarmupAccountIds.size > 0
-      ? "Auto: on"
-      : "Auto: off";
+      ? "自动：已开启"
+      : "自动：已关闭";
   }, [autoWarmupAccountIds.size, autoWarmupAllEnabled, autoWarmupRunningIds]);
 
   const timedWarmupTargetsReady = useMemo(
@@ -963,13 +968,13 @@ function App() {
 
         await warmupAccount(accountId);
         markSuccessfulWarmup(accountId, Date.now(), window);
-        const modeLabel = window.kind === "session" ? "5h" : "weekly";
-        showWarmupToast(`Auto ${modeLabel} warm-up sent for ${accountName}`);
+        const modeLabel = window.kind === "session" ? "5 小时" : "每周";
+        showWarmupToast(`已向 ${accountName} 发送 ${modeLabel} 自动预热请求`);
       } catch (err) {
         console.error("Auto warm-up failed:", err);
         backOffAutoWarmupRetry(accountId);
         showWarmupToast(
-          `Auto warm-up failed for ${accountName}: ${formatWarmupError(err)}`,
+          `${accountName} 自动预热失败：${formatWarmupError(err)}`,
           true
         );
       } finally {
@@ -1038,17 +1043,17 @@ function App() {
           markSuccessfulWarmup(account.id, warmedAt);
           warmed += 1;
         } catch (err) {
-          console.error("Timed warm-up failed:", err);
+          console.error("定时预热 failed:", err);
           failed += 1;
         }
       }
 
       if (failed === 0) {
         showWarmupToast(
-          `Timed warm-up sent for ${warmed} account${warmed === 1 ? "" : "s"}`
+          `定时预热 sent for ${warmed} account${warmed === 1 ? "" : "s"}`
         );
       } else {
-        showWarmupToast(`Timed warm-up: ${warmed} ok, ${failed} failed`, true);
+        showWarmupToast(`定时预热: ${warmed} ok, ${failed} failed`, true);
       }
     } finally {
       setTimedWarmupRunning(false);
@@ -1115,8 +1120,8 @@ function App() {
   }, []);
 
   const timedWarmupLabel = useMemo(() => {
-    if (timedWarmupRunning) return "Timed warming...";
-    if (!timedWarmupEnabled || timedWarmupTimes.length === 0) return "Timed: off";
+    if (timedWarmupRunning) return "正在定时预热…";
+    if (!timedWarmupEnabled || timedWarmupTimes.length === 0) return "定时：已关闭";
 
     const now = new Date();
     const nowMinutes = now.getHours() * 60 + now.getMinutes();
@@ -1124,7 +1129,7 @@ function App() {
       const [hours, minutes] = time.split(":").map(Number);
       return hours * 60 + minutes > nowMinutes;
     });
-    return `Timed: ${upcoming ?? timedWarmupTimes[0]}`;
+    return `定时：${upcoming ?? timedWarmupTimes[0]}`;
   }, [timedWarmupEnabled, timedWarmupRunning, timedWarmupTimes]);
 
   const handleExportSlimText = async () => {
@@ -1138,12 +1143,12 @@ function App() {
       setIsExportingSlim(true);
       const payload = await exportAccountsSlimText();
       setConfigPayload(payload);
-      showWarmupToast(`Slim text exported (${accounts.length} accounts).`);
+      showWarmupToast(`精简文本已导出（${accounts.length} 个账号）。`);
     } catch (err) {
       console.error("Failed to export slim text:", err);
       const message = err instanceof Error ? err.message : String(err);
       setConfigModalError(message);
-      showWarmupToast("Slim export failed", true);
+      showWarmupToast("精简文本导出失败", true);
     } finally {
       setIsExportingSlim(false);
     }
@@ -1159,7 +1164,7 @@ function App() {
 
   const handleImportSlimText = async () => {
     if (!configPayload.trim()) {
-      setConfigModalError("Please paste the slim text string first.");
+      setConfigModalError("请先粘贴精简配置文本。");
       return;
     }
 
@@ -1170,13 +1175,13 @@ function App() {
       setMaskedAccounts(new Set());
       setIsConfigModalOpen(false);
       showWarmupToast(
-        `Imported ${summary.imported_count}, skipped ${summary.skipped_count} (total ${summary.total_in_payload})`
+        `已导入 ${summary.imported_count} 个，跳过 ${summary.skipped_count} 个（共 ${summary.total_in_payload} 个）`
       );
     } catch (err) {
       console.error("Failed to import slim text:", err);
       const message = err instanceof Error ? err.message : String(err);
       setConfigModalError(message);
-      showWarmupToast("Slim import failed", true);
+      showWarmupToast("精简文本导入失败", true);
     } finally {
       setIsImportingSlim(false);
     }
@@ -1187,10 +1192,10 @@ function App() {
       setIsExportingFull(true);
       const exported = await exportFullBackupFile();
       if (!exported) return;
-      showWarmupToast("Full encrypted file exported.");
+      showWarmupToast("完整加密备份已导出。");
     } catch (err) {
       console.error("Failed to export full encrypted file:", err);
-      showWarmupToast("Full export failed", true);
+      showWarmupToast("完整备份导出失败", true);
     } finally {
       setIsExportingFull(false);
     }
@@ -1206,11 +1211,11 @@ function App() {
       const maskedIds = await loadMaskedAccountIds();
       setMaskedAccounts(new Set(maskedIds));
       showWarmupToast(
-        `Imported ${summary.imported_count}, skipped ${summary.skipped_count} (total ${summary.total_in_payload})`
+        `已导入 ${summary.imported_count} 个，跳过 ${summary.skipped_count} 个（共 ${summary.total_in_payload} 个）`
       );
     } catch (err) {
       console.error("Failed to import full encrypted file:", err);
-      showWarmupToast("Full import failed", true);
+      showWarmupToast("完整备份导入失败", true);
     } finally {
       setIsImportingFull(false);
     }
@@ -1220,13 +1225,13 @@ function App() {
     try {
       setIsOpeningCodex(true);
       await invokeBackend("open_codex_app");
-      showWarmupToast("Codex app opened.");
+      showWarmupToast("已打开 Codex。");
       setTimeout(() => {
         void checkProcesses();
       }, 1500);
     } catch (err) {
       console.error("Failed to open Codex app:", err);
-      showWarmupToast(`Open Codex failed: ${formatWarmupError(err)}`, true);
+      showWarmupToast(`打开 Codex 失败： ${formatWarmupError(err)}`, true);
     } finally {
       setIsOpeningCodex(false);
     }
@@ -1235,13 +1240,15 @@ function App() {
   const activeAccount = accounts.find((a) => a.is_active);
   const otherAccounts = accounts.filter((a) => !a.is_active);
   const hasRunningProcesses = processInfo && processInfo.count > 0;
+  const canCloseDesktop = canCloseCodexDesktop(processInfo);
+  const hasExternalProcesses = (processInfo?.external_count ?? 0) > 0;
   const pendingSwitchAccount = useMemo(
     () => accounts.find((account) => account.id === pendingSwitchAccountId),
     [accounts, pendingSwitchAccountId]
   );
   const closeConfirmLabel = pendingSwitchAccount
-    ? "Close and switch account"
-    : "Close Codex";
+    ? "关闭桌面并切换账号"
+    : "关闭 Codex 桌面";
 
   const sortedOtherAccounts = useMemo(() => {
     const getResetDeadline = (resetAt: number | null | undefined) =>
@@ -1361,7 +1368,7 @@ function App() {
                   void appWindow.minimize();
                 }}
                 className="flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100"
-                title="Minimize"
+                title="最小化窗口"
               >
                 <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                   <path d="M5 12h14" strokeWidth="2" strokeLinecap="round" />
@@ -1372,7 +1379,7 @@ function App() {
                   void appWindow.toggleMaximize();
                 }}
                 className="flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-gray-100 hover:text-gray-900 dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-gray-100"
-                title={isWindowMaximized ? "Restore" : "Maximize"}
+                title={isWindowMaximized ? "还原窗口" : "最大化窗口"}
               >
                 {isWindowMaximized ? (
                   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor">
@@ -1390,7 +1397,7 @@ function App() {
                   void appWindow.close();
                 }}
                 className="flex h-8 w-8 items-center justify-center rounded-md text-gray-500 transition-colors hover:bg-red-500 hover:text-white dark:text-gray-400 dark:hover:bg-red-500 dark:hover:text-white"
-                title="Close"
+                title="关闭"
               >
                 <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor">
                   <path d="M6 6l12 12M18 6L6 18" strokeWidth="2" strokeLinecap="round" />
@@ -1422,33 +1429,47 @@ function App() {
                         ></span>
                         <span>
                           {hasRunningProcesses
-                            ? `${processInfo.count} Codex running`
-                            : "0 Codex running"}
+                            ? `${processInfo.count} 个 Codex 服务运行中`
+                            : "无 Codex 服务运行"}
                         </span>
                       </span>
                       {hasRunningProcesses && (
+                        <span className="inline-flex" title={hasExternalProcesses ? "独立服务仍在运行，请先在服务面板中处理；此按钮仅正常退出桌面" : "请求 Codex 桌面正常退出，不会强制结束任务"}>
                         <button
                           onClick={() => {
                             setPendingSwitchAccountId(null);
                             setForceCloseConfirmOpen(true);
                           }}
-                          disabled={isForceClosingCodex}
+                          disabled={isForceClosingCodex || !canCloseDesktop}
                           className="inline-flex items-center rounded-md border border-red-200 bg-red-50 px-2 py-0.5 text-xs font-medium text-red-700 transition-colors hover:bg-red-100 disabled:opacity-50 dark:border-red-800 dark:bg-red-900/20 dark:text-red-300 dark:hover:bg-red-900/30"
-                          title="Close running Codex processes"
+                          title={hasExternalProcesses ? "请先在“运行中的服务”中检查并停止独立会话，再正常退出桌面" : "正常退出 Codex 桌面客户端"}
                         >
-                          Close
+                          关闭桌面
                         </button>
+                        </span>
                       )}
                     </div>
+                  )}
+                  {isTauriRuntime() && (
+                    <button onClick={() => setIsProcessPanelOpen(true)}
+                      title="查看 Codex 相关服务的名称、PID 和路径，并按需逐项停止独立服务"
+                      className="rounded-md border border-gray-200 px-2 py-1 text-xs text-gray-700 hover:bg-gray-100 dark:border-gray-700 dark:text-gray-200 dark:hover:bg-gray-800">
+                      运行中的服务
+                    </button>
+                  )}
+                  {hasExternalProcesses && (
+                    <p className="w-full text-xs text-amber-700 dark:text-amber-300">
+                      {processInfo?.external_count} 个独立服务仍在运行。可在“运行中的服务”中查看详情并逐项停止。
+                    </p>
                   )}
                   {isTauriRuntime() && processInfo && !hasRunningProcesses && (
                     <button
                       onClick={handleOpenCodexApp}
                       disabled={isOpeningCodex || isCompletingForceClose || switchingId !== null}
                       className="inline-flex items-center rounded-md border border-green-200 bg-green-50 px-2 py-0.5 text-xs font-medium text-green-700 transition-colors hover:bg-green-100 disabled:opacity-50 dark:border-green-800 dark:bg-green-900/20 dark:text-green-300 dark:hover:bg-green-900/30"
-                      title="Open Codex app"
+                      title="打开 Codex 桌面客户端"
                     >
-                      {isOpeningCodex ? "Opening..." : "Open Codex"}
+                      {isOpeningCodex ? "正在打开…" : "打开 Codex"}
                     </button>
                   )}
                 </div>
@@ -1458,8 +1479,9 @@ function App() {
             <div className="flex flex-wrap items-center gap-2 shrink-0 md:ml-4 md:w-max md:flex-nowrap md:justify-end">
               <button
                 onClick={toggleMaskAll}
+                aria-label={allMasked ? "显示账号信息" : "隐藏账号信息"}
                 className="flex h-10 w-10 items-center justify-center rounded-lg bg-gray-100 text-gray-700 transition-colors hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 shrink-0"
-                title={allMasked ? "Show all account names and emails" : "Hide all account names and emails"}
+                title={allMasked ? "显示所有账号的名称和邮箱，便于识别账号" : "隐藏所有账号的名称和邮箱，方便截图或共享屏幕"}
               >
                 {allMasked ? (
                   <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1479,24 +1501,28 @@ function App() {
               </button>
               <button
                 onClick={handleRefresh}
+                aria-label="刷新全部用量"
                 disabled={isRefreshing}
                 className="flex h-10 w-10 items-center justify-center rounded-lg bg-gray-100 text-gray-700 transition-colors hover:bg-gray-200 disabled:opacity-50 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700 shrink-0"
-                title={isRefreshing ? "Refreshing all usage" : "Refresh all usage"}
+                title={isRefreshing ? "正在更新全部账号的用量和订阅信息" : "刷新全部账号的剩余额度和订阅信息"}
               >
                 <span className={isRefreshing ? "animate-spin inline-block" : ""}>↻</span>
               </button>
+              <span className="inline-flex" title={accounts.length === 0 ? "先添加账号后才能预热。预热会发送少量测试请求并消耗额度。" : "预热全部账号：发送少量测试请求，会消耗少量额度"}>
               <button
                 onClick={() => void handleWarmupAll()}
+                aria-label="预热全部账号"
                 disabled={isWarmingAll || accounts.length === 0}
                 className={`flex h-10 w-10 items-center justify-center rounded-lg transition-colors disabled:opacity-50 shrink-0 ${
                   isWarmingAll
                     ? "bg-amber-100 text-amber-500 dark:bg-amber-900/30 dark:text-amber-300"
                     : "bg-amber-50 text-amber-700 hover:bg-amber-100 dark:bg-amber-900/20 dark:text-amber-300 dark:hover:bg-amber-900/40"
                 }`}
-                title={isWarmingAll ? "Warming up all accounts" : "Warm up all accounts"}
+                title={accounts.length === 0 ? "先添加账号后才能预热。预热会发送少量测试请求并消耗额度。" : isWarmingAll ? "正在向全部账号发送少量测试请求" : "预热全部账号：发送少量测试请求，会消耗少量额度"}
               >
                 <span className={isWarmingAll ? "animate-pulse" : ""}>⚡</span>
               </button>
+              </span>
               {isAccountSearchEnabled && (
                 <button
                   onClick={() => {
@@ -1510,7 +1536,7 @@ function App() {
                       ? "bg-gray-900 text-white hover:bg-gray-800 dark:bg-black dark:text-white dark:hover:bg-neutral-900"
                       : "bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
                   }`}
-                  title={isAccountSearchOpen ? "Hide account search" : "Search accounts"}
+                  title={isAccountSearchOpen ? "收起账号搜索并清空搜索条件" : "按名称或邮箱搜索账号"}
                 >
                   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <circle cx="11" cy="11" r="7" />
@@ -1530,7 +1556,8 @@ function App() {
                       ? "bg-gray-900 text-white hover:bg-gray-800 dark:bg-black dark:text-white dark:hover:bg-neutral-900"
                       : "bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-200 dark:hover:bg-gray-700"
                   }`}
-                  title="Menu"
+                  title="更多功能：设置、自动预热、定时预热和外观"
+                  aria-label="更多功能"
                 >
                   <svg className="h-4 w-4" viewBox="0 0 24 24" fill="currentColor">
                     <circle cx="12" cy="5" r="1.6" />
@@ -1545,19 +1572,21 @@ function App() {
                         setIsNavMenuOpen(false);
                         setIsSettingsOpen(true);
                       }}
+                      title="设置正常关闭方式及切换后是否重新打开 Codex"
                       className="flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 dark:text-white dark:hover:bg-neutral-900"
                     >
-                      Settings
+                      设置
                     </button>
                     <button
                       onClick={() => {
                         setIsNavMenuOpen(false);
                         setAutoWarmupAllEnabled((prev) => !prev);
                       }}
+                      title="在额度重置后自动发送少量请求，启动下一轮计时；会消耗额度"
                       disabled={accounts.length === 0}
                       className="flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
                     >
-                      <span>Auto Warm Up</span>
+                      <span>自动预热</span>
                       <span
                         className={`rounded-md px-1.5 py-0.5 text-[11px] font-medium ${
                           autoWarmupAllEnabled
@@ -1573,9 +1602,10 @@ function App() {
                         setIsNavMenuOpen(false);
                         setIsTimedWarmupOpen((prev) => !prev);
                       }}
+                      title="设置每天的预热时间；预热会发送请求并消耗少量额度"
                       className="flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 dark:text-white dark:hover:bg-neutral-900"
                     >
-                      <span>Timer</span>
+                      <span>定时预热</span>
                       <span
                         className={`rounded-md px-1.5 py-0.5 text-[11px] font-medium ${
                           timedWarmupEnabled
@@ -1591,11 +1621,12 @@ function App() {
                         setIsNavMenuOpen(false);
                         setThemeMode((prev) => (prev === "dark" ? "light" : "dark"));
                       }}
+                      title="在浅色和深色界面之间切换"
                       className="flex w-full items-center justify-between gap-2 rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 dark:text-white dark:hover:bg-neutral-900"
                     >
-                      <span>Appearance</span>
+                      <span>外观</span>
                       <span className="text-[11px] text-gray-400 dark:text-gray-500">
-                        {themeMode === "dark" ? "☾ Dark" : "☀ Light"}
+                        {themeMode === "dark" ? "☾ 深色" : "☀ 浅色"}
                       </span>
                     </button>
                   </div>
@@ -1603,7 +1634,7 @@ function App() {
                 {isTimedWarmupOpen && (
                   <div className="absolute right-0 z-20 mt-2 w-64 rounded-lg border border-gray-200 bg-white p-3 shadow-lg dark:border-gray-700 dark:bg-gray-900">
                     <label className="flex items-center justify-between text-sm font-medium text-gray-800 dark:text-gray-100">
-                      <span>Timed warm-up</span>
+                      <span>定时预热</span>
                       <input
                         type="checkbox"
                         checked={timedWarmupEnabled}
@@ -1614,7 +1645,7 @@ function App() {
                     <div className="mt-3 space-y-1">
                       {timedWarmupTimes.length === 0 ? (
                         <p className="text-xs italic text-gray-400 dark:text-gray-500">
-                          No times added yet.
+                          尚未设置预热时间。
                         </p>
                       ) : (
                         timedWarmupTimes.map((time) => (
@@ -1628,7 +1659,7 @@ function App() {
                             <button
                               onClick={() => handleRemoveTimedWarmupTime(time)}
                               className="text-gray-400 transition-colors hover:text-red-500"
-                              title={`Remove ${time}`}
+                              title={`移除 ${time} 的定时预热`}
                             >
                               ✕
                             </button>
@@ -1649,10 +1680,11 @@ function App() {
                       />
                       <button
                         onClick={handleAddTimedWarmupTime}
+                title="将所选时间加入每日自动预热计划，会消耗少量额度"
                         disabled={!timedWarmupDraft}
                         className="h-8 rounded-md bg-gray-900 px-3 text-xs font-semibold text-white transition-colors hover:bg-gray-800 disabled:opacity-50 dark:bg-black dark:hover:bg-neutral-900"
                       >
-                        Add
+                        添加
                       </button>
                     </div>
                   </div>
@@ -1661,9 +1693,10 @@ function App() {
               <div className="relative" ref={actionsMenuRef}>
                 <button
                   onClick={() => setIsActionsMenuOpen((prev) => !prev)}
+                title="添加账号，或导入、导出账号备份"
                   className="h-10 px-4 py-2 text-sm font-medium rounded-lg bg-gray-900 text-white transition-colors hover:bg-gray-800 dark:bg-black dark:hover:bg-neutral-900 shrink-0 whitespace-nowrap"
                 >
-                  Account ▾
+                  账号 ▾
                 </button>
                 {isActionsMenuOpen && (
                   <div className="absolute right-0 z-50 mt-2 w-56 rounded-xl border border-gray-200 bg-white p-2 text-gray-700 shadow-xl dark:border-neutral-800 dark:bg-black dark:text-white">
@@ -1672,49 +1705,54 @@ function App() {
                         setIsActionsMenuOpen(false);
                         setIsAddModalOpen(true);
                       }}
+                      title="添加一个账号，仅保存登录状态，不切换当前账号"
                       className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 dark:text-white dark:hover:bg-neutral-900"
                     >
-                      + Add Account
+                      + 添加账号
                     </button>
                     <button
                       onClick={() => {
                         setIsActionsMenuOpen(false);
                         void handleExportSlimText();
                       }}
+                      title="将账号凭据导出为精简文本，请勿分享给他人"
                       disabled={isExportingSlim}
                       className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
                     >
-                      {isExportingSlim ? "Exporting..." : "Export Slim Text"}
+                      {isExportingSlim ? "正在导出…" : "导出精简文本"}
                     </button>
                     <button
                       onClick={() => {
                         setIsActionsMenuOpen(false);
                         openImportSlimTextModal();
                       }}
+                      title="粘贴精简备份文本并导入其中未保存的账号"
                       disabled={isImportingSlim}
                       className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
                     >
-                      {isImportingSlim ? "Importing..." : "Import Slim Text"}
+                      {isImportingSlim ? "正在导入…" : "导入精简文本"}
                     </button>
                     <button
                       onClick={() => {
                         setIsActionsMenuOpen(false);
                         void handleExportFullFile();
                       }}
+                      title="将完整账号信息保存为加密备份文件"
                       disabled={isExportingFull}
                       className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
                     >
-                      {isExportingFull ? "Exporting..." : "Export Full Encrypted File"}
+                      {isExportingFull ? "正在导出…" : "导出完整加密备份"}
                     </button>
                     <button
                       onClick={() => {
                         setIsActionsMenuOpen(false);
                         void handleImportFullFile();
                       }}
+                      title="从完整加密备份文件中恢复账号"
                       disabled={isImportingFull}
                       className="w-full rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:text-white dark:hover:bg-neutral-900"
                     >
-                      {isImportingFull ? "Importing..." : "Import Full Encrypted File"}
+                      {isImportingFull ? "正在导入…" : "导入完整加密备份"}
                     </button>
                   </div>
                 )}
@@ -1729,11 +1767,11 @@ function App() {
         {loading && accounts.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-20">
             <div className="animate-spin h-10 w-10 border-2 border-gray-900 dark:border-gray-100 border-t-transparent rounded-full mb-4"></div>
-            <p className="text-gray-500 dark:text-gray-400">Loading accounts...</p>
+            <p className="text-gray-500 dark:text-gray-400">正在加载账号…</p>
           </div>
         ) : error ? (
           <div className="text-center py-20">
-            <div className="text-red-600 dark:text-red-300 mb-2">Failed to load accounts</div>
+            <div className="text-red-600 dark:text-red-300 mb-2">账号加载失败</div>
             <p className="text-sm text-gray-500 dark:text-gray-400">{error}</p>
           </div>
         ) : accounts.length === 0 ? (
@@ -1742,16 +1780,17 @@ function App() {
               <span className="text-3xl">👤</span>
             </div>
             <h2 className="text-xl font-semibold text-gray-900 dark:text-gray-100 mb-2">
-              No accounts yet
+              还没有添加账号
             </h2>
             <p className="text-gray-500 dark:text-gray-400 mb-6">
-              Add your first Codex account to get started
+              先添加一个 Codex 账号，即可管理和切换
             </p>
             <button
               onClick={() => setIsAddModalOpen(true)}
+                title="通过 ChatGPT 授权或登录文件添加账号；添加后不会自动切换"
               className="px-6 py-3 text-sm font-medium rounded-lg bg-gray-900 hover:bg-gray-800 dark:bg-gray-100 dark:hover:bg-gray-200 text-white dark:text-gray-900 transition-colors"
             >
-              Add Account
+              添加账号
             </button>
           </div>
         ) : (
@@ -1759,10 +1798,10 @@ function App() {
             {hasNoMatchingAccounts && (
               <div className="rounded-2xl border border-dashed border-gray-300 px-6 py-12 text-center dark:border-gray-700">
                 <h2 className="text-base font-semibold text-gray-900 dark:text-gray-100">
-                  No matching accounts
+                  没有找到匹配的账号
                 </h2>
                 <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
-                  Try a different account name or email address.
+                  请尝试其他账号名称或邮箱。
                 </p>
               </div>
             )}
@@ -1786,8 +1825,8 @@ function App() {
                   type="search"
                   value={accountSearchQuery}
                   onChange={(event) => setAccountSearchQuery(event.target.value)}
-                  placeholder="Search accounts by name or email"
-                  aria-label="Search accounts"
+                  placeholder="输入账号名称或邮箱"
+                  aria-label="按名称或邮箱搜索账号"
                   autoFocus
                   className="w-full rounded-xl border border-gray-300 bg-white py-2.5 pl-10 pr-10 text-sm text-gray-900 shadow-sm transition-colors placeholder:text-gray-400 focus:border-gray-400 focus:outline-none focus:ring-2 focus:ring-gray-200 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-100 dark:placeholder:text-gray-500 dark:focus:border-gray-600 dark:focus:ring-gray-800"
                 />
@@ -1795,7 +1834,8 @@ function App() {
                   <button
                     type="button"
                     onClick={() => setAccountSearchQuery("")}
-                    aria-label="Clear account search"
+                    aria-label="清空搜索条件，显示全部账号"
+                    title="清空搜索条件，显示全部账号"
                     className="absolute inset-y-0 right-2 flex items-center px-2 text-gray-400 transition-colors hover:text-gray-700 dark:text-gray-500 dark:hover:text-gray-200"
                   >
                     <svg
@@ -1813,12 +1853,12 @@ function App() {
               </div>
             )}
 
-            {/* Active Account */}
+            {/* 当前账号 */}
             {activeAccount &&
               matchesAccountSearch(activeAccount, normalizedAccountSearchQuery) && (
                 <section>
                   <h2 className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-4">
-                    Active Account
+                    当前账号
                   </h2>
                   <AccountCard
                     account={activeAccount}
@@ -1860,15 +1900,15 @@ function App() {
               <section>
                 <div className="flex items-center justify-between gap-3 mb-4">
                   <h2 className="text-sm font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider">
-                    Other Accounts ({
+                    其他账号（{
                       normalizedAccountSearchQuery
-                        ? `${visibleOtherAccounts.length} of ${otherAccounts.length}`
+                        ? `${visibleOtherAccounts.length} / ${otherAccounts.length}`
                         : otherAccounts.length
-                    })
+                    }）
                   </h2>
                   <div className="flex items-center gap-2">
                     <label htmlFor="other-accounts-sort" className="text-xs text-gray-500 dark:text-gray-400">
-                      Sort
+                      排序
                     </label>
                     <div className="relative">
                       <select
@@ -1887,19 +1927,19 @@ function App() {
                         }
                         className="appearance-none font-sans text-xs sm:text-sm font-medium pl-3 pr-9 py-2 rounded-xl border border-gray-300 dark:border-gray-700 bg-gradient-to-b from-white to-gray-50 dark:from-gray-900 dark:to-gray-800 text-gray-700 dark:text-gray-200 shadow-sm hover:border-gray-400 dark:hover:border-gray-600 hover:shadow focus:outline-none focus:ring-2 focus:ring-gray-300 dark:focus:ring-gray-600 focus:border-gray-400 dark:focus:border-gray-600 transition-all"
                       >
-                        <option value="deadline_asc">Reset: earliest to latest</option>
-                        <option value="deadline_desc">Reset: latest to earliest</option>
+                        <option value="deadline_asc">额度重置：由早到晚</option>
+                        <option value="deadline_desc">额度重置：由晚到早</option>
                         <option value="remaining_desc">
-                          % remaining: highest to lowest
+                          剩余额度：由多到少
                         </option>
                         <option value="remaining_asc">
-                          % remaining: lowest to highest
+                          剩余额度：由少到多
                         </option>
                         <option value="subscription_asc">
-                          Expiry: earliest to latest
+                          订阅到期：由早到晚
                         </option>
                         <option value="subscription_desc">
-                          Expiry: latest to earliest
+                          订阅到期：由晚到早
                         </option>
                       </select>
                       <span className="pointer-events-none absolute inset-y-0 right-3 flex items-center text-gray-500 dark:text-gray-400">
@@ -1960,7 +2000,7 @@ function App() {
       {/* Refresh Success Toast */}
       {refreshSuccess && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-3 bg-green-600 text-white rounded-lg shadow-lg text-sm flex items-center gap-2">
-          <span>✓</span> Usage refreshed successfully
+          <span>✓</span> 用量信息已更新
         </div>
       )}
 
@@ -1980,7 +2020,7 @@ function App() {
       {/* Delete Confirmation Toast */}
       {deleteConfirmId && (
         <div className="fixed bottom-6 left-1/2 -translate-x-1/2 px-4 py-3 bg-red-600 text-white rounded-lg shadow-lg text-sm">
-          Click delete again to confirm removal
+          再次点击删除，确认移除账号
         </div>
       )}
 
@@ -1999,41 +2039,40 @@ function App() {
           <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl w-full max-w-md mx-4 shadow-xl">
             <div className="p-5 border-b border-gray-100 dark:border-gray-800">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-                Close running Codex processes?
+                关闭 Codex 桌面客户端？
               </h2>
             </div>
             <div className="p-5 space-y-3">
               <p className="text-sm text-gray-600 dark:text-gray-300">
-                This will {codexClose.forceClose ? "force close" : "gracefully close"} {processInfo?.count ?? 0} Codex process
-                {(processInfo?.count ?? 0) === 1 ? "" : "es"} that currently{" "}
-                {(processInfo?.count ?? 0) === 1 ? "blocks" : "block"} account switching.
+                请先确认桌面内的任务已结束。工具会请求正常退出，等待客户端完全关闭后才切换账号。
               </p>
+              {!canCloseDesktop && (
+                <p role="alert" className="text-sm text-amber-700 dark:text-amber-300">
+                  {hasExternalProcesses
+                    ? `检测到 ${processInfo?.external_count} 个独立 CLI、后台服务或 IDE 会话。请先在“运行中的服务”中检查并逐项停止，再重试切换。`
+                    : "尚未确认可安全关闭的 Codex 桌面客户端，请取消并刷新状态后重试。"}
+                </p>
+              )}
               <div className="space-y-2 rounded-lg border border-gray-200 bg-gray-50 p-3 dark:border-gray-700 dark:bg-gray-800">
                 {codexClose.preference !== "ask" ? (
                   <p className="text-sm text-gray-500 dark:text-gray-400">
-                    Codex will {codexClose.forceClose ? "be force closed" : "close gracefully"}. You can change this in Settings.
+                    仅正常退出桌面客户端，不提供强制关闭。
                   </p>
                 ) : (
                   <>
-                    <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
-                      <input type="checkbox" checked={codexClose.forceClose} onChange={(event) => codexClose.setForceClose(event.target.checked)} disabled={isForceClosingCodex} className="h-4 w-4 accent-red-600" />
-                      Force close Codex
-                    </label>
                     <label className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
                       <input type="checkbox" checked={codexClose.remember} onChange={(event) => codexClose.setRemember(event.target.checked)} disabled={isForceClosingCodex} className="h-4 w-4 accent-orange-600" />
-                      Remember this selection
+                      记住本次选择
                     </label>
                     <p className="text-xs text-gray-500 dark:text-gray-400">
-                      {codexClose.forceClose
-                        ? "Stops Codex immediately. Unsaved work may be lost."
-                        : "Asks Codex to quit normally so it can finish cleanup."}
+                      仅正常退出桌面客户端，不提供强制关闭。
                     </p>
                   </>
                 )}
               </div>
               {pendingSwitchAccount && (
                 <p className="text-sm text-gray-600 dark:text-gray-300">
-                  After closing Codex, Codex Switcher will switch to{" "}
+                  关闭 Codex 后，将切换到{" "}
                   <span className="font-medium text-gray-900 dark:text-gray-100">
                     {pendingSwitchAccount.name}
                   </span>
@@ -2042,33 +2081,30 @@ function App() {
               )}
               <div className="space-y-2 rounded-lg bg-gray-50 dark:bg-gray-800 p-3">
                 {desktopReopen.checking ? (
-                  <p className="text-sm text-gray-500 dark:text-gray-400">Checking for a desktop app to reopen...</p>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">正在检查可重新打开的桌面应用…</p>
                 ) : desktopReopen.available && desktopReopen.preference !== "ask" ? (
                   <p className="text-sm text-gray-500 dark:text-gray-400">
                     {desktopReopen.preference === "always"
-                      ? "Codex desktop will reopen automatically."
-                      : "Codex desktop will stay closed."}{" "}
-                    You can change this in Settings.
+                      ? "Codex 桌面将自动重新打开。"
+                      : "Codex 桌面将保持关闭。"}{" "}
+                    可在设置中修改。
                   </p>
                 ) : desktopReopen.available ? (
                   <>
                     <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
                       <input type="checkbox" checked={desktopReopen.reopen} onChange={(event) => desktopReopen.setReopen(event.target.checked)} disabled={isForceClosingCodex} className="h-4 w-4 accent-orange-600" />
-                      Reopen Codex desktop after close
+                      关闭后重新打开 Codex 桌面
                     </label>
                     <label className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
                       <input type="checkbox" checked={desktopReopen.remember} onChange={(event) => desktopReopen.setRemember(event.target.checked)} disabled={isForceClosingCodex} className="h-4 w-4 accent-orange-600" />
-                      Remember this selection
+                      记住本次选择
                     </label>
-                    <p className="text-xs text-gray-500 dark:text-gray-400">You can change this later in Settings. Terminal and IDE sessions will not reopen.</p>
+                    <p className="text-xs text-gray-500 dark:text-gray-400">可稍后在设置中修改。独立 CLI、后台服务和 IDE 会话需单独停止。</p>
                   </>
                 ) : (
-                  <p className="text-sm text-gray-500 dark:text-gray-400">No supported desktop app could be identified for reopening. Codex will only be closed.</p>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">未识别到支持的桌面应用，无法自动重新打开。</p>
                 )}
               </div>
-              {codexClose.forceClose && (
-                <p className="text-sm text-red-600 dark:text-red-300">Unsaved Codex work may be lost.</p>
-              )}
             </div>
             <div className="flex justify-end gap-3 p-5 border-t border-gray-100 dark:border-gray-800">
               <button
@@ -2076,20 +2112,22 @@ function App() {
                   setPendingSwitchAccountId(null);
                   setForceCloseConfirmOpen(false);
                 }}
+                title="取消关闭，保留当前桌面和登录状态"
                 disabled={isForceClosingCodex}
                 className="px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 transition-colors disabled:opacity-50"
               >
-                Cancel
+                取消
               </button>
               <button
                 onClick={() => {
                   void handleForceCloseConfirm();
                 }}
-                disabled={isForceClosingCodex || desktopReopen.checking}
-                className={`px-4 py-2.5 text-sm font-medium rounded-lg text-white transition-colors disabled:opacity-50 ${codexClose.forceClose ? "bg-red-600 hover:bg-red-700" : "bg-orange-600 hover:bg-orange-700"}`}
+                title="请求 Codex 桌面正常退出，确认退出后才继续切换"
+                disabled={isForceClosingCodex || desktopReopen.checking || !canCloseDesktop}
+                className="px-4 py-2.5 text-sm font-medium rounded-lg text-white transition-colors disabled:opacity-50 bg-orange-600 hover:bg-orange-700"
               >
                 {isForceClosingCodex
-                  ? (codexClose.forceClose ? "Force closing..." : "Closing...")
+                  ? "正在关闭桌面…"
                   : closeConfirmLabel}
               </button>
             </div>
@@ -2102,15 +2140,15 @@ function App() {
           <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl w-full max-w-md mx-4 shadow-xl">
             <div className="p-5 border-b border-gray-100 dark:border-gray-800">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-                Keep Codex Switcher in the Dock?
+                关闭窗口后保留 Dock 图标？
               </h2>
             </div>
             <div className="p-5 space-y-4">
               <p className="text-sm text-gray-600 dark:text-gray-300">
-                When the window is closed, Codex Switcher can stay in the Dock or live only in the menu bar.
+                关闭窗口后，可保留 Dock 图标，或仅在菜单栏中运行。
               </p>
               <p className="text-sm text-gray-600 dark:text-gray-300">
-                You can always change this later from the tray popup.
+                可随时从菜单栏面板中修改。
               </p>
               <label className="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-200">
                 <input
@@ -2119,37 +2157,40 @@ function App() {
                   onChange={(event) => setCloseBehaviorDontAskAgain(event.target.checked)}
                   className="h-4 w-4 accent-gray-900 dark:accent-gray-100"
                 />
-                <span>Don't ask again</span>
+                <span>不再询问</span>
               </label>
             </div>
             <div className="flex flex-col gap-2 p-5 border-t border-gray-100 dark:border-gray-800 sm:flex-row sm:justify-end">
               <button
                 onClick={() => setCloseBehaviorPromptOpen(false)}
+                title="取消本次关闭窗口操作"
                 disabled={isCompletingCloseBehavior}
                 className="px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 transition-colors disabled:opacity-50"
               >
-                Cancel
+                取消
               </button>
               <button
                 onClick={() => void handleCloseBehaviorChoice("show_in_dock")}
+                title="关闭窗口后保留 Dock 图标，应用继续运行"
                 disabled={isCompletingCloseBehavior}
                 className="px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 transition-colors disabled:opacity-50"
               >
-                Keep in Dock
+                保留 Dock 图标
               </button>
               <button
                 onClick={() => void handleCloseBehaviorChoice("menu_bar_only")}
+                title="关闭窗口后仅在顶部菜单栏运行"
                 disabled={isCompletingCloseBehavior}
                 className="px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-900 hover:bg-gray-800 dark:bg-gray-100 dark:hover:bg-gray-200 text-white dark:text-gray-900 transition-colors disabled:opacity-50"
               >
-                Menu Bar Only
+                仅在菜单栏运行
               </button>
             </div>
           </div>
         </div>
       )}
 
-      {/* Add Account Modal */}
+      {/* 添加账号 Modal */}
       <AddAccountModal
         isOpen={isAddModalOpen}
         onClose={() => setIsAddModalOpen(false)}
@@ -2165,10 +2206,11 @@ function App() {
           <div className="bg-white dark:bg-gray-900 border border-gray-200 dark:border-gray-700 rounded-2xl w-full max-w-2xl mx-4 shadow-xl">
             <div className="flex items-center justify-between p-5 border-b border-gray-100 dark:border-gray-800">
               <h2 className="text-lg font-semibold text-gray-900 dark:text-gray-100">
-                {configModalMode === "slim_export" ? "Export Slim Text" : "Import Slim Text"}
+                {configModalMode === "slim_export" ? "导出精简文本" : "导入精简文本"}
               </h2>
               <button
                 onClick={() => setIsConfigModalOpen(false)}
+                title="关闭导入或导出窗口"
                 className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 transition-colors"
               >
                 ✕
@@ -2177,11 +2219,11 @@ function App() {
             <div className="p-5 space-y-4">
               {configModalMode === "slim_import" ? (
                 <p className="text-sm text-amber-700 dark:text-amber-200 bg-amber-50 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-700 rounded-lg px-3 py-2">
-                  Existing accounts are kept. Only missing accounts are imported.
+                  保留现有账号，仅导入尚未添加的账号。
                 </p>
               ) : (
                 <p className="text-sm text-gray-500 dark:text-gray-400">
-                  This slim string contains account secrets. Keep it private.
+                  精简文本包含账号登录凭据，请妥善保管，不要分享。
                 </p>
               )}
               <textarea
@@ -2191,9 +2233,9 @@ function App() {
                 placeholder={
                   configModalMode === "slim_export"
                     ? isExportingSlim
-                      ? "Generating..."
-                      : "Export string will appear here"
-                    : "Paste config string here"
+                      ? "正在生成…"
+                      : "导出的文本将显示在这里"
+                    : "在这里粘贴配置文本"
                 }
                 className="w-full h-48 px-4 py-3 bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg text-sm text-gray-800 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:border-gray-400 dark:focus:border-gray-500 focus:ring-1 focus:ring-gray-400 dark:focus:ring-gray-500 font-mono"
               />
@@ -2206,9 +2248,10 @@ function App() {
             <div className="flex gap-3 p-5 border-t border-gray-100 dark:border-gray-800">
               <button
                 onClick={() => setIsConfigModalOpen(false)}
+                title="关闭导入或导出窗口"
                 className="px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-200 transition-colors"
               >
-                Close
+                关闭
               </button>
               {configModalMode === "slim_export" ? (
                 <button
@@ -2219,27 +2262,31 @@ function App() {
                       setConfigCopied(true);
                       setTimeout(() => setConfigCopied(false), 1500);
                     } catch {
-                      setConfigModalError("Clipboard unavailable. Please copy manually.");
+                      setConfigModalError("无法访问剪贴板，请手动复制。");
                     }
                   }}
+                  title="复制包含登录凭据的备份文本，请勿分享给他人"
                   disabled={!configPayload || isExportingSlim}
                   className="px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-900 hover:bg-gray-800 dark:bg-gray-100 dark:hover:bg-gray-200 text-white dark:text-gray-900 transition-colors disabled:opacity-50"
                 >
-                  {configCopied ? "Copied" : "Copy String"}
+                  {configCopied ? "已复制" : "复制文本"}
                 </button>
               ) : (
                 <button
                   onClick={handleImportSlimText}
+                title="导入文本中尚未保存的账号，保留现有账号"
                   disabled={isImportingSlim}
                   className="px-4 py-2.5 text-sm font-medium rounded-lg bg-gray-900 hover:bg-gray-800 dark:bg-gray-100 dark:hover:bg-gray-200 text-white dark:text-gray-900 transition-colors disabled:opacity-50"
                 >
-                  {isImportingSlim ? "Importing..." : "Import Missing Accounts"}
+                  {isImportingSlim ? "正在导入…" : "导入尚未添加的账号"}
                 </button>
               )}
             </div>
           </div>
         </div>
       )}
+      {isProcessPanelOpen && <ProcessPanel onClose={() => setIsProcessPanelOpen(false)} onProcessesChanged={async () => { await checkProcesses(); }} />}
+      <HoverHelp />
       <UpdateChecker />
 
     </div>

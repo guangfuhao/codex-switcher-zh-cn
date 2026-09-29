@@ -109,18 +109,15 @@ async fn exchange_code_for_tokens(
         .body(body)
         .send()
         .await
-        .context("Failed to send token request")?;
+        .context("发送登录授权请求失败")?;
 
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        anyhow::bail!("Token exchange failed: {status} - {body}");
+        anyhow::bail!("交换登录凭据失败：{status} - {body}");
     }
 
-    let tokens: TokenResponse = resp
-        .json()
-        .await
-        .context("Failed to parse token response")?;
+    let tokens: TokenResponse = resp.json().await.context("解析登录授权响应失败")?;
     Ok(tokens)
 }
 
@@ -152,7 +149,7 @@ pub async fn start_oauth_login(
             );
             Server::http("127.0.0.1:0").map_err(|fallback_err| {
                 anyhow::anyhow!(
-                    "Failed to start OAuth server: default port {DEFAULT_PORT} error: {default_err}; fallback error: {fallback_err}"
+                    "无法启动本地登录回调服务：默认端口 {DEFAULT_PORT} 错误：{default_err}；备用端口错误：{fallback_err}"
                 )
             })?
         }
@@ -160,7 +157,7 @@ pub async fn start_oauth_login(
 
     let actual_port = match server.server_addr().to_ip() {
         Some(addr) => addr.port(),
-        None => anyhow::bail!("Failed to determine server port"),
+        None => anyhow::bail!("无法确定本地登录服务端口"),
     };
 
     let redirect_uri = format!("http://localhost:{actual_port}/auth/callback");
@@ -215,11 +212,11 @@ async fn run_oauth_server(
 
     loop {
         if cancelled.load(Ordering::Relaxed) {
-            anyhow::bail!("OAuth login cancelled");
+            anyhow::bail!("登录已取消");
         }
 
         if start.elapsed() > timeout {
-            anyhow::bail!("OAuth login timed out");
+            anyhow::bail!("登录已超时，请重新登录");
         }
 
         // Use recv_timeout to allow checking the timeout
@@ -269,7 +266,7 @@ async fn handle_oauth_request(
     let parsed = match url::Url::parse(&format!("http://localhost{url_str}")) {
         Ok(u) => u,
         Err(_) => {
-            let _ = request.respond(Response::from_string("Bad Request").with_status_code(400));
+            let _ = request.respond(Response::from_string("请求无效").with_status_code(400));
             return HandleResult::Continue;
         }
     };
@@ -291,20 +288,21 @@ async fn handle_oauth_request(
             let error_desc = params
                 .get("error_description")
                 .map(|s| s.as_str())
-                .unwrap_or("Unknown error");
+                .unwrap_or("未知错误");
             println!("[OAuth] Error from provider: {error} - {error_desc}");
             let _ = request.respond(
-                Response::from_string(format!("OAuth Error: {error} - {error_desc}"))
+                Response::from_string(format!("登录授权失败：{error} - {error_desc}"))
                     .with_status_code(400),
             );
-            return HandleResult::Error(anyhow::anyhow!("OAuth error: {error} - {error_desc}"));
+            return HandleResult::Error(anyhow::anyhow!("登录授权失败：{error} - {error_desc}"));
         }
 
         // Verify state
         if params.get("state").map(String::as_str) != Some(expected_state) {
             println!("[OAuth] State mismatch!");
-            let _ = request.respond(Response::from_string("State mismatch").with_status_code(400));
-            return HandleResult::Error(anyhow::anyhow!("OAuth state mismatch"));
+            let _ = request
+                .respond(Response::from_string("登录校验不一致，请重新登录").with_status_code(400));
+            return HandleResult::Error(anyhow::anyhow!("登录校验不一致，请重新登录"));
         }
 
         println!("[OAuth] State verified OK");
@@ -314,10 +312,9 @@ async fn handle_oauth_request(
             Some(c) if !c.is_empty() => c.clone(),
             _ => {
                 println!("[OAuth] Missing authorization code");
-                let _ = request.respond(
-                    Response::from_string("Missing authorization code").with_status_code(400),
-                );
-                return HandleResult::Error(anyhow::anyhow!("Missing authorization code"));
+                let _ = request
+                    .respond(Response::from_string("缺少授权码，请重新登录").with_status_code(400));
+                return HandleResult::Error(anyhow::anyhow!("缺少授权码，请重新登录"));
             }
         };
 
@@ -346,7 +343,7 @@ async fn handle_oauth_request(
                 let success_html = r#"<!DOCTYPE html>
 <html>
 <head>
-    <title>Login Successful</title>
+    <title>登录成功</title>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
         .container { text-align: center; background: white; padding: 40px 60px; border-radius: 16px; box-shadow: 0 20px 60px rgba(0,0,0,0.3); }
@@ -358,8 +355,8 @@ async fn handle_oauth_request(
 <body>
     <div class="container">
         <div class="checkmark">✓</div>
-        <h1>Login Successful!</h1>
-        <p>You can close this window and return to Codex Switcher.</p>
+        <h1>登录成功</h1>
+        <p>可以关闭此窗口，返回 Codex 账号切换工具。</p>
     </div>
 </body>
 </html>"#;
@@ -375,8 +372,7 @@ async fn handle_oauth_request(
             Err(e) => {
                 println!("[OAuth] Token exchange failed: {e}");
                 let _ = request.respond(
-                    Response::from_string(format!("Token exchange failed: {e}"))
-                        .with_status_code(500),
+                    Response::from_string(format!("交换登录凭据失败：{e}")).with_status_code(500),
                 );
                 return HandleResult::Error(e);
             }
@@ -384,7 +380,7 @@ async fn handle_oauth_request(
     }
 
     // Handle other paths
-    let _ = request.respond(Response::from_string("Not Found").with_status_code(404));
+    let _ = request.respond(Response::from_string("页面不存在").with_status_code(404));
     HandleResult::Continue
 }
 
@@ -392,6 +388,6 @@ async fn handle_oauth_request(
 pub async fn wait_for_oauth_login(
     rx: oneshot::Receiver<Result<OAuthLoginResult>>,
 ) -> Result<StoredAccount> {
-    let result = rx.await.context("OAuth login was cancelled")??;
+    let result = rx.await.context("登录已取消")??;
     Ok(result.account)
 }

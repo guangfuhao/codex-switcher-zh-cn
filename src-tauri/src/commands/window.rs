@@ -127,7 +127,7 @@ pub fn set_tray_display_mode(app: AppHandle, mode: TrayDisplayMode) -> Result<()
     #[cfg(not(desktop))]
     {
         let _ = (app, mode);
-        Err("Tray settings are only available on desktop".into())
+        Err("托盘设置仅适用于桌面客户端".into())
     }
 }
 

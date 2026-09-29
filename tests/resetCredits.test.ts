@@ -64,6 +64,6 @@ test("reset expiry includes both date and local time", () => {
 });
 
 test("missing and malformed expiry values remain visible", () => {
-  assert.equal(formatResetCreditDateTime(null), "No expiry");
-  assert.equal(formatResetCreditDateTime("not-a-date"), "Expiry unavailable");
+  assert.equal(formatResetCreditDateTime(null), "无到期时间");
+  assert.equal(formatResetCreditDateTime("not-a-date"), "到期时间不可用");
 });

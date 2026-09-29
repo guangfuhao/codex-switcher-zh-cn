@@ -190,12 +190,12 @@ pub async fn get_account_usage_stats(account_id: String) -> Result<AccountUsageS
         .accounts
         .iter()
         .find(|account| account.id == account_id)
-        .ok_or_else(|| format!("Account not found: {account_id}"))?;
+        .ok_or_else(|| format!("找不到账号：{account_id}"))?;
 
     if account.auth_mode != AuthMode::ChatGPT {
         return Ok(unavailable_stats(
             account_id,
-            "Usage stats are available for ChatGPT accounts only.",
+            "用量统计仅支持 ChatGPT 账号。",
         ));
     }
 
@@ -249,7 +249,7 @@ async fn parse_profile_usage_response(
     if !status.is_success() {
         return Ok(unavailable_stats(
             account_id.to_string(),
-            &format!("Usage stats request failed: {status}"),
+            &format!("请求用量统计失败：{status}"),
         ));
     }
 
@@ -271,7 +271,7 @@ async fn fetch_reset_credits(account: &StoredAccount) -> anyhow::Result<AccountR
 
     let status = response.status();
     if !status.is_success() {
-        anyhow::bail!("Reset credits request failed: {status}");
+        anyhow::bail!("请求额度重置次数失败：{status}");
     }
 
     let payload: ResetCreditsResponse = response.json().await?;
@@ -289,7 +289,7 @@ fn map_profile_usage(account_id: &str, payload: ProfileUsageResponse) -> Account
     AccountUsageStats {
         account_id: account_id.to_string(),
         available,
-        source: "Codex usage stats via ChatGPT backend".to_string(),
+        source: "来自 ChatGPT 服务的 Codex 用量统计".to_string(),
         generated_at: payload.metadata.generated_at,
         stats_as_of: payload.metadata.stats_as_of,
         summary: AccountUsageSummary {
@@ -388,7 +388,7 @@ fn unavailable_stats(account_id: String, message: &str) -> AccountUsageStats {
     AccountUsageStats {
         account_id,
         available: false,
-        source: "Codex usage stats via ChatGPT backend".to_string(),
+        source: "来自 ChatGPT 服务的 Codex 用量统计".to_string(),
         generated_at: None,
         stats_as_of: None,
         summary: AccountUsageSummary::default(),
@@ -445,7 +445,7 @@ fn extract_chatgpt_auth(account: &StoredAccount) -> anyhow::Result<(&str, Option
             account_id,
             ..
         } => Ok((access_token.as_str(), account_id.as_deref())),
-        AuthData::ApiKey { .. } => anyhow::bail!("Account is not using ChatGPT OAuth"),
+        AuthData::ApiKey { .. } => anyhow::bail!("此账号没有使用 ChatGPT 授权登录"),
     }
 }
 

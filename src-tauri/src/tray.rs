@@ -14,10 +14,10 @@ use tauri::{
 
 use crate::{
     api::usage::get_account_usage,
-    auth::{get_account, get_accounts_file, load_accounts, load_app_settings},
+    auth::{get_account, get_accounts_file, load_app_settings},
     commands::{
-        is_codex_running_switch_block, restore_main_window, switch_account_by_id,
-        window::TRAY_WINDOW,
+        account::load_accounts_for_display as load_accounts, is_codex_running_switch_block,
+        restore_main_window, switch_account_by_id, window::TRAY_WINDOW,
     },
     types::{AccountsStore, TrayDisplayMode, UsageInfo},
 };
@@ -66,7 +66,7 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
 
     let builder = TrayIconBuilder::with_id(TRAY_ID)
         .icon(icon)
-        .tooltip("Codex Switcher")
+        .tooltip("Codex 账号切换")
         .menu(&menu)
         .on_menu_event(handle_menu_event);
 
@@ -236,7 +236,7 @@ fn create_tray_window<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     }
 
     let window = WebviewWindowBuilder::new(app, TRAY_WINDOW, WebviewUrl::App("tray.html".into()))
-        .title("Codex Switcher")
+        .title("Codex 账号切换")
         .inner_size(TRAY_WIDTH, TRAY_HEIGHT)
         .resizable(false)
         .decorations(false)
@@ -319,7 +319,7 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, store: &AccountsStore) -> tauri::R
 
     if store.accounts.is_empty() {
         menu.append(
-            &MenuItemBuilder::with_id("empty", "No accounts configured")
+            &MenuItemBuilder::with_id("empty", "尚未添加账号")
                 .enabled(false)
                 .build(app)?,
         )?;
@@ -339,8 +339,8 @@ fn build_menu<R: Runtime>(app: &AppHandle<R>, store: &AccountsStore) -> tauri::R
     append_dock_settings_menu(app, &menu)?;
     #[cfg(target_os = "macos")]
     menu.append(&PredefinedMenuItem::separator(app)?)?;
-    menu.append(&MenuItemBuilder::with_id(OPEN_ITEM_ID, "Open Codex Switcher").build(app)?)?;
-    menu.append(&MenuItemBuilder::with_id(QUIT_ITEM_ID, "Quit").build(app)?)?;
+    menu.append(&MenuItemBuilder::with_id(OPEN_ITEM_ID, "打开账号切换工具").build(app)?)?;
+    menu.append(&MenuItemBuilder::with_id(QUIT_ITEM_ID, "退出").build(app)?)?;
     Ok(menu)
 }
 
@@ -349,17 +349,18 @@ fn append_dock_settings_menu<R: Runtime>(app: &AppHandle<R>, menu: &Menu<R>) -> 
     let settings = load_app_settings().unwrap_or_default();
     let dock_settings = Submenu::with_items(
         app,
-        "Dock Icon",
+        "程序坞图标",
         true,
         &[
-            &CheckMenuItemBuilder::with_id(crate::app_menu::DOCK_SHOW_IN_DOCK_ID, "Show in Dock")
+            &CheckMenuItemBuilder::with_id(crate::app_menu::DOCK_SHOW_IN_DOCK_ID, "在程序坞显示")
                 .checked(settings.dock_display_mode == crate::app_menu::DockDisplayMode::ShowInDock)
                 .build(app)?,
-            &CheckMenuItemBuilder::with_id(crate::app_menu::DOCK_MENU_BAR_ONLY_ID, "Menu Bar Only")
-                .checked(
-                    settings.dock_display_mode == crate::app_menu::DockDisplayMode::MenuBarOnly,
-                )
-                .build(app)?,
+            &CheckMenuItemBuilder::with_id(
+                crate::app_menu::DOCK_MENU_BAR_ONLY_ID,
+                "仅显示在菜单栏",
+            )
+            .checked(settings.dock_display_mode == crate::app_menu::DockDisplayMode::MenuBarOnly)
+            .build(app)?,
         ],
     )?;
     menu.append(&dock_settings)?;
@@ -535,14 +536,12 @@ fn active_usage_title(active_account_id: Option<&str>) -> String {
         .and_then(|cache| cache.get(active_account_id).cloned());
 
     match usage {
-        Some(usage) if usage.error.is_none() => {
-            usage_title(
-                usage.primary_used_percent,
-                usage.primary_window_minutes,
-                usage.secondary_used_percent,
-                usage.secondary_window_minutes,
-            )
-        }
+        Some(usage) if usage.error.is_none() => usage_title(
+            usage.primary_used_percent,
+            usage.primary_window_minutes,
+            usage.secondary_used_percent,
+            usage.secondary_window_minutes,
+        ),
         _ => "H:-- W:--".to_string(),
     }
 }
@@ -555,13 +554,13 @@ fn usage_title(
 ) -> String {
     let mut parts = Vec::new();
     if let Some(remaining) = remaining_percent_label(primary_used_percent) {
-        let label = window_duration_label(primary_window_minutes)
-            .unwrap_or_else(|| "H".to_string());
+        let label =
+            window_duration_label(primary_window_minutes).unwrap_or_else(|| "H".to_string());
         parts.push(format!("{label}:{remaining}"));
     }
     if let Some(remaining) = remaining_percent_label(secondary_used_percent) {
-        let label = window_duration_label(secondary_window_minutes)
-            .unwrap_or_else(|| "W".to_string());
+        let label =
+            window_duration_label(secondary_window_minutes).unwrap_or_else(|| "W".to_string());
         parts.push(format!("{label}:{remaining}"));
     }
 
@@ -615,8 +614,8 @@ fn usage_suffix(account_id: &str) -> String {
 
     let mut parts = Vec::new();
     if let Some(remaining) = session_remaining_title(usage.primary_used_percent, false) {
-        let label = window_duration_label(usage.primary_window_minutes)
-            .unwrap_or_else(|| "S".to_string());
+        let label =
+            window_duration_label(usage.primary_window_minutes).unwrap_or_else(|| "S".to_string());
         parts.push(format!("{label}:{remaining}"));
     }
     if let Some(used) = usage.secondary_used_percent {
@@ -831,17 +830,17 @@ mod tests {
             usage_title(None, None, Some(35.0), Some(7 * 24 * 60)),
             "7d:65%"
         );
-        assert_eq!(
-            usage_title(Some(27.0), Some(5 * 60), None, None),
-            "5h:73%"
-        );
+        assert_eq!(usage_title(Some(27.0), Some(5 * 60), None, None), "5h:73%");
         assert_eq!(usage_title(None, None, None, None), "H:-- W:--");
     }
 
     #[test]
     fn window_duration_labels_round_to_hours_and_days() {
         assert_eq!(window_duration_label(Some(5 * 60)), Some("5h".to_string()));
-        assert_eq!(window_duration_label(Some(12 * 60)), Some("12h".to_string()));
+        assert_eq!(
+            window_duration_label(Some(12 * 60)),
+            Some("12h".to_string())
+        );
         assert_eq!(
             window_duration_label(Some(7 * 24 * 60)),
             Some("7d".to_string())
